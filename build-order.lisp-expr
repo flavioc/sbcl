@@ -245,6 +245,7 @@
  #!+bsd   ("src/code/bsd-os"   :not-host)
  #!+linux ("src/code/linux-os" :not-host)
  #!+win32 ("src/code/win32-os" :not-host)
+ #!+hurd ("src/code/hurd-os" :not-host)
 
  ;; sparc-vm and ppc-vm need sc-offset defined to get at internal
  ;; error args. This file contains stuff previously in

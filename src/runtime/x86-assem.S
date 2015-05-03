@@ -33,7 +33,7 @@
  * (Except Win32, which is unlikely ever to be ELF, sorry. -- AB 2005-12-08)
  */
 #if defined __linux__  || defined LISP_FEATURE_FREEBSD || defined __NetBSD__ || defined __OpenBSD__ || \
-        defined __sun || defined __DragonFly__
+        defined __sun || defined __DragonFly__ || defined LISP_FEATURE_HURD
 #define GNAME(var) var
 #else
 #define GNAME(var) _##var
@@ -49,7 +49,7 @@
  * rid of? -- WHN 2004-04-18)
  */
 #if defined(__linux__) || defined(LISP_FEATURE_FREEBSD) || defined(__NetBSD__) || defined(__OpenBSD__) || \
-        defined(__sun) || defined(LISP_FEATURE_WIN32) || defined(__DragonFly__)
+        defined(__sun) || defined(LISP_FEATURE_WIN32) || defined(__DragonFly__) || defined(LISP_FEATURE_HURD)
 #define align_4byte	4
 #define align_8byte	8
 #define align_16byte	16
@@ -134,7 +134,7 @@
 	movl	SBCL_THREAD_BASE_EA, reg ;      \
 	movl	offset(reg), reg ;
 #elif defined(LISP_FEATURE_LINUX) || defined(LISP_FEATURE_SUNOS) || defined(LISP_FEATURE_FREEBSD) || \
-        defined(LISP_FEATURE_DRAGONFLY)
+        defined(LISP_FEATURE_DRAGONFLY) || defined(LISP_FEATURE_HURD)
   /* see comment in arch_os_thread_init */
 # define SBCL_THREAD_BASE_EA %fs:THREAD_SELFPTR_OFFSET
 # define MAYBE_FS(addr) addr

@@ -66,6 +66,8 @@ context_eflags_addr(os_context_t *context)
      * we need to do this nasty absolute index magic number thing
      * instead. */
     return &context->uc_mcontext.gregs[16];
+#elif defined(LISP_FEATURE_HURD)
+    return &context->uc_mcontext.gregs[16];
 #elif defined(LISP_FEATURE_FREEBSD) || defined(__DragonFly__)
     return &context->uc_mcontext.mc_eflags;
 #elif defined __OpenBSD__

@@ -104,6 +104,7 @@ char * sb_realpath (char *path)
     char *ret;
     int errnum;
 
+#ifdef PATH_MAX
     if ((ret = calloc(PATH_MAX, sizeof(char))) == NULL)
         return NULL;
     if (realpath(path, ret) == NULL) {
@@ -112,6 +113,12 @@ char * sb_realpath (char *path)
         errno = errnum;
         return NULL;
     }
+#else
+    ret = realpath(path, NULL);
+    if(ret == NULL)
+                return NULL;
+#endif
+
     return(ret);
 #else
     char *ret;

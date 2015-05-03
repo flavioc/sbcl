@@ -14,6 +14,9 @@
  */
 
 #include "sbcl.h"
+#ifdef LISP_FEATURE_HURD
+#define _GNU_SOURCE 1
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -137,27 +140,46 @@ char *
 copied_realpath(const char *pathname)
 {
     char *messy, *tidy;
-    size_t len;
+    size_t len, len_messy;
 
     /* realpath() supposedly can't be counted on to always return
      * an absolute path, so we prepend the cwd to relative paths */
     messy = NULL;
     if (pathname[0] != '/') {
-        messy = successful_malloc(PATH_MAX + 1);
-        if (getcwd(messy, PATH_MAX + 1) == NULL) {
+#ifdef PATH_MAX
+        len_messy = PATH_MAX + 1;
+        messy = successful_malloc(len_messy);
+        if (getcwd(messy, len_messy) == NULL) {
             free(messy);
             return NULL;
         }
+#else
+        messy = get_current_dir_name();
+        len_messy = strlen(messy) + 1;
+        char *tmp = successful_malloc(len_messy + strlen(pathname));
+        memcpy(tmp, messy, len_messy);
+        free(messy);
+        len_messy += strlen(pathname);
+        messy = tmp;
+#endif
         len = strlen(messy);
-        snprintf(messy + len, PATH_MAX + 1 - len, "/%s", pathname);
+        snprintf(messy + len, len_messy - len, "/%s", pathname);
     }
 
+#ifdef PATH_MAX
     tidy = successful_malloc(PATH_MAX + 1);
     if (realpath((messy ? messy : pathname), tidy) == NULL) {
         free(messy);
         free(tidy);
         return NULL;
     }
+#else
+    tidy = realpath((messy ? messy : pathname), NULL);
+    if(tidy == NULL) {
+        free(messy);
+        return NULL;
+    }
+#endif
 
     return tidy;
 }
@@ -284,6 +306,7 @@ search_for_executable(const char *argv0)
     if (search == NULL)
         return NULL;
     search = copied_string(search);
+#ifdef PATH_MAX
     buf = successful_malloc(PATH_MAX + 1);
     for (start = search; (end = strchr(start, ':')) != NULL; start = end + 1) {
         *end = '\0';
@@ -295,11 +318,34 @@ search_for_executable(const char *argv0)
             return search;
         }
     }
+#else
+    buf = NULL;
+    for (start = search; (end = strchr(start, ':')) != NULL; start = end + 1) {
+        *end = '\0';
+                const size_t buf_len = strlen(start) + 1 + strlen(argv0) + 1;
+                buf = successful_malloc(buf_len);
+        snprintf(buf, buf_len, "%s/%s", start, argv0);
+        if (access(buf, F_OK) == 0) {
+            free(search);
+            search = copied_realpath(buf);
+            free(buf);
+            return search;
+        }
+        free(buf);
+    }
+#endif
+
     /* The above for-loop fails to process the last part of PATH if PATH does
      * not end with ':'. We may consider appending an extra ':' to the end of
      * SEARCH.  -- houjingyi 2013-05-24 */
     if (start != NULL && *start != '\0') {
+#ifdef PATH_MAX
         snprintf(buf, PATH_MAX + 1, "%s/%s", start, argv0);
+#else
+                const size_t buf_len = strlen(start) + 1 + strlen(argv0) + 1;
+                buf = successful_malloc(buf_len);
+        snprintf(buf, buf_len, "%s/%s", start, argv0);
+#endif
         if (access(buf, F_OK) == 0) {
             free(search);
             search = copied_realpath(buf);

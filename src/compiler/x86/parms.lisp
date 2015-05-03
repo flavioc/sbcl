@@ -195,6 +195,7 @@
 #!+openbsd   (!gencgc-space-setup #x1b000000 #x40000000)
 #!+netbsd    (!gencgc-space-setup #x20000000 #x60000000)
 #!+darwin    (!gencgc-space-setup #x04000000 #x10000000)
+#!+hurd      (!gencgc-space-setup #x09000000 #x10000000)
 
 ;;; Size of one linkage-table entry in bytes.
 (def!constant linkage-table-entry-size 8)

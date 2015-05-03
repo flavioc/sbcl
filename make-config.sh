@@ -265,6 +265,9 @@ case `uname` in
     Linux)
         sbcl_os="linux"
         ;;
+    GNU)
+	sbcl_os="hurd"
+	;;
     OSF1)
         # it's changed name twice since it was called OSF/1: clearly
         # the marketers forgot to tell the engineers about Digital Unix
@@ -456,6 +459,15 @@ rm -f Config target-arch-os.h target-arch.h target-os.h target-lispregs.h
 link_or_copy $sbcl_arch-arch.h target-arch.h
 link_or_copy $sbcl_arch-lispregs.h target-lispregs.h
 case "$sbcl_os" in
+    hurd)
+	printf ' :unix' >> $ltf
+	printf ' :sb-futex' >> $ltf
+	printf ' :hurd' >> $ltf
+        printf ' :elf' >> $ltf
+        link_or_copy Config.$sbcl_arch-hurd Config
+        link_or_copy $sbcl_arch-hurd-os.h target-arch-os.h
+        link_or_copy hurd-os.h target-os.h
+        ;;
     linux)
         printf ' :unix' >> $ltf
         printf ' :elf' >> $ltf
@@ -629,7 +641,7 @@ if [ "$sbcl_arch" = "x86" ]; then
     printf ' :alien-callbacks :cycle-counter :inline-constants :precise-arg-count-error' >> $ltf
     printf ' :memory-barrier-vops :multiply-high-vops :ash-right-vops :symbol-info-vops' >> $ltf
     case "$sbcl_os" in
-    linux | freebsd | gnu-kfreebsd | netbsd | openbsd | sunos | darwin | win32 | dragonfly)
+    linux | freebsd | gnu-kfreebsd | netbsd | openbsd | sunos | darwin | win32 | dragonfly | hurd)
         printf ' :linkage-table' >> $ltf
     esac
     if [ "$sbcl_os" = "win32" ]; then

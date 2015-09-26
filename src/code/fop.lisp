@@ -142,6 +142,9 @@
 (!define-fop 3 (fop-truth) t)
 (!define-fop 4 (fop-push ((:operands index)))
   (ref-fop-table (fasl-input) index))
+(!define-fop 9 (fop-move-to-table (x))
+  (push-fop-table x (fasl-input))
+  x)
 
 ;;; CMU CL had FOP-POP-FOR-EFFECT as fop 65, but it was never used and seemed
 ;;; to have no possible use.
@@ -238,6 +241,11 @@
 
 (declaim (freeze-type undefined-package))
 
+;; Not the same as the real definition, but nobody cares.
+;; We'd just better not get this error.
+#+sb-xc-host
+(deftype simple-package-error () 'simple-error)
+
 (defun aux-fop-intern (size package fasl-input)
   (declare (optimize speed))
   (let ((input-stream (%fasl-input-stream fasl-input))
@@ -257,10 +265,8 @@
                (list (subseq buffer 0 size)
                      (undefined-package-error package)))
         (push-fop-table (without-package-locks
-                          (intern* buffer
-                                   size
-                                   package
-                                   :no-copy t)) fasl-input))))
+                          (%intern buffer size package nil))
+                        fasl-input))))
 
 (!define-fop 80 (fop-lisp-symbol-save ((:operands namelen)))
   (aux-fop-intern namelen *cl-package* (fasl-input)))
@@ -277,17 +283,29 @@
 (!define-fop #xF0 (fop-symbol-in-package-save ((:operands pkg-index namelen)))
   (aux-fop-intern namelen (ref-fop-table (fasl-input) pkg-index) (fasl-input)))
 
-(!define-fop 96 (fop-uninterned-symbol-save ((:operands namelen)))
-  (let ((res (make-string namelen)))
-    #!-sb-unicode
-    (read-string-as-bytes (fasl-input-stream) res)
-    #!+sb-unicode
-    (read-string-as-unsigned-byte-32 (fasl-input-stream) res)
-    (push-fop-table (make-symbol res) (fasl-input))))
+;;; Symbol-hash is usually computed lazily and memoized into a symbol.
+;;; Laziness slightly improves the speed of allocation.
+;;; But when loading fasls, the time spent in the loader totally swamps
+;;; any time savings of not precomputing symbol-hash.
+;;; INTERN hashes everything anyway, so let's be consistent
+;;; and precompute the hashes of uninterned symbols too.
+(macrolet ((ensure-hashed (symbol-form)
+             `(let ((symbol ,symbol-form))
+                (ensure-symbol-hash symbol)
+                symbol)))
+  (!define-fop 96 (fop-uninterned-symbol-save ((:operands namelen)))
+    (let ((res (make-string namelen)))
+      #!-sb-unicode
+      (read-string-as-bytes (fasl-input-stream) res)
+      #!+sb-unicode
+      (read-string-as-unsigned-byte-32 (fasl-input-stream) res)
+      (push-fop-table (ensure-hashed (make-symbol res))
+                      (fasl-input))))
 
-(!define-fop 104 (fop-copy-symbol-save ((:operands table-index)))
-  (push-fop-table (copy-symbol (ref-fop-table (fasl-input) table-index))
-                  (fasl-input)))
+  (!define-fop 104 (fop-copy-symbol-save ((:operands table-index)))
+    (push-fop-table (ensure-hashed
+                     (copy-symbol (ref-fop-table (fasl-input) table-index)))
+                    (fasl-input))))
 
 (!define-fop 44 (fop-package (pkg-designator))
   (find-undeleted-package-or-lose pkg-designator))
@@ -434,6 +452,7 @@
 (progn
   #+sb-xc-host
   (!define-fop 160 (fop-character-string ((:operands length)))
+    length ; touch the argument to avoid style-warning
     (bug "CHARACTER-STRING FOP encountered"))
 
   #-sb-xc-host
@@ -563,7 +582,7 @@
 
 ;; this gets you an #<fdefn> object, not the result of (FDEFINITION x)
 (!define-fop 60 (fop-fdefn (name))
-  (awhen (deprecated-thing-p :function name) ; returns the stage of deprecation
+  (awhen (deprecated-thing-p 'function name) ; returns the stage of deprecation
     (pushnew (list* it name :function)
              (%fasl-input-deprecated-stuff (fasl-input)) :test 'equal))
   (find-or-create-fdefn name))
@@ -592,7 +611,8 @@ a bug.~@:>")
 
 (!define-fop 139 (fop-fun-entry (code-object name arglist type info))
   #+sb-xc-host ; since xc host doesn't know how to compile %PRIMITIVE
-  (error "FOP-FUN-ENTRY can't be defined without %PRIMITIVE.")
+  (progn code-object name arglist type info ; touch the arguments
+         (error "FOP-FUN-ENTRY can't be defined without %PRIMITIVE."))
   #-sb-xc-host
   (let ((offset (read-word-arg (fasl-input-stream))))
     (declare (type index offset))

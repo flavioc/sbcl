@@ -126,7 +126,7 @@
   #!+sb-doc
   "Return the element type that will actually be used to implement an array
    with the specifier :ELEMENT-TYPE Spec."
-  (declare (ignore environment))
+  (declare (type lexenv-designator environment) (ignore environment))
   (handler-case
       ;; Can't rely on SPECIFIER-TYPE to signal PARSE-UNKNOWN-TYPE in
       ;; the case of (AND KNOWN UNKNOWN), since the result of the
@@ -143,7 +143,7 @@
   #!+sb-doc
   "Return the element type of the most specialized COMPLEX number type that
    can hold parts of type SPEC."
-  (declare (ignore environment))
+  (declare (type lexenv-designator environment) (ignore environment))
   (let ((type (specifier-type spec)))
     (cond
       ((eq type *empty-type*) nil)
@@ -190,16 +190,16 @@
     (numeric-type
      (cond ((type= type (specifier-type 'fixnum))
             'sb!c:check-fixnum)
-           #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+           #!-64-bit
            ((type= type (specifier-type '(signed-byte 32)))
             'sb!c:check-signed-byte-32)
-           #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+           #!-64-bit
            ((type= type (specifier-type '(unsigned-byte 32)))
             'sb!c:check-unsigned-byte-32)
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+           #!+64-bit
            ((type= type (specifier-type '(signed-byte 64)))
             'sb!c:check-signed-byte-64)
-           #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+           #!+64-bit
            ((type= type (specifier-type '(unsigned-byte 64)))
             'sb!c:check-unsigned-byte-64)
            (t nil)))

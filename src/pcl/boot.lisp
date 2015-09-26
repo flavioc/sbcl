@@ -209,7 +209,7 @@ bootstrapping.
                (setf (initarg car-option)
                      `',(cdr option)))
               (:argument-precedence-order
-               (let* ((required (parse-lambda-list lambda-list))
+               (let* ((required (nth-value 1 (parse-lambda-list lambda-list)))
                       (supplied (cdr option)))
                  (unless (= (length required) (length supplied))
                    (error 'simple-program-error
@@ -284,38 +284,29 @@ bootstrapping.
   (:default-initargs :references (list '(:ansi-cl :section (3 4 2)))))
 
 (defun check-gf-lambda-list (lambda-list)
-  (flet ((symbol-or-singleton-p (arg)
-           (typep arg '(or symbol (cons symbol null))))
-         (complain (arg)
-             (error 'generic-function-lambda-list-error
+  (flet ((verify-each-atom-or-singleton (kind args)
+           ;; PARSE-LAMBDA-LIST validates the skeleton,
+           ;; so just check for incorrect use of defaults.
+           ;; This works for both &OPTIONAL and &KEY.
+           (dolist (arg args)
+             (or (not (listp arg))
+                 (null (cdr arg))
+                 (error 'generic-function-lambda-list-error
                     :format-control
-                    "~@<invalid ~S ~_in the generic function lambda list ~S~:>"
-                    :format-arguments (list arg lambda-list))))
-    (multiple-value-bind (required optional restp rest keyp keys allowp
-                          auxp aux morep more-context more-count)
-        (parse-lambda-list lambda-list)
-      (declare (ignore required)) ; since they're no different in a gf ll
-      (declare (ignore restp rest)) ; since they're no different in a gf ll
-      (declare (ignore allowp)) ; since &ALLOW-OTHER-KEYS is fine either way
-      (declare (ignore aux)) ; since we require AUXP=NIL
-      (declare (ignore more-context more-count)) ; safely ignored unless MOREP
-      ;; no defaults allowed for &OPTIONAL arguments
-      (dolist (arg optional)
-        (or (symbol-or-singleton-p arg) (complain arg)))
-      ;; no defaults allowed for &KEY arguments
-      (when keyp
-        (dolist (arg keys)
-          (or (symbol-or-singleton-p arg)
-              (typep arg '(cons (cons symbol (cons symbol null)) null))
-              (complain arg))))
-      ;; no &AUX allowed
-      (when auxp
-        (error "&AUX is not allowed in a generic function lambda list: ~S"
-               lambda-list))
-      ;; Oh, *puhlease*... not specifically as per section 3.4.2 of
-      ;; the ANSI spec, but the CMU CL &MORE extension does not
-      ;; belong here!
-      (aver (not morep)))))
+                    "~@<invalid ~A argument specifier ~S ~_in the ~
+generic function lambda list ~S~:>"
+                    :format-arguments (list kind arg lambda-list))))))
+    (multiple-value-bind (llks required optional rest keys)
+        (parse-lambda-list
+         lambda-list
+         :accept (lambda-list-keyword-mask
+                    '(&optional &rest &key &allow-other-keys))
+         :condition-class 'generic-function-lambda-list-error
+         :context "a generic function lambda list")
+      (declare (ignore llks required rest))
+      ;; no defaults or supplied-p vars allowed for &OPTIONAL or &KEY
+      (verify-each-atom-or-singleton '&optional optional)
+      (verify-each-atom-or-singleton '&key keys))))
 
 (defmacro defmethod (name &rest args)
   (multiple-value-bind (qualifiers lambda-list body)
@@ -415,6 +406,10 @@ bootstrapping.
   (multiple-value-bind (parameters unspecialized-lambda-list specializers)
       (parse-specialized-lambda-list lambda-list)
     (declare (ignore parameters))
+    (mapc (lambda (specializer)
+            (when (typep specializer 'type-specifier)
+              (check-deprecated-type specializer)))
+          specializers)
     (let ((method-lambda `(lambda ,unspecialized-lambda-list ,@body))
           (*method-name* `(,name ,@qualifiers ,specializers))
           (*method-lambda-list* lambda-list))
@@ -1633,58 +1628,24 @@ bootstrapping.
                   (intern-pv-table :slot-name-lists snl))))))))
 
 (defun analyze-lambda-list (lambda-list)
-  (flet (;; FIXME: Is this redundant with SB-C::MAKE-KEYWORD-FOR-ARG?
-         (parse-key-arg (arg)
-           (if (listp arg)
-               (if (listp (car arg))
-                   (caar arg)
-                   (keywordicate (car arg)))
-               (keywordicate arg))))
-    (let ((nrequired 0)
-          (noptional 0)
-          (keysp nil)
-          (restp nil)
-          (nrest 0)
-          (allow-other-keys-p nil)
-          (keywords ())
-          (keyword-parameters ())
-          (state 'required))
-      (dolist (x lambda-list)
-        (if (memq x lambda-list-keywords)
-            (case x
-              (&optional         (setq state 'optional))
-              (&key              (setq keysp t
-                                       state 'key))
-              (&allow-other-keys (setq allow-other-keys-p t))
-              (&rest             (setq restp t
-                                       state 'rest))
-              (&aux           (return t))
-              (otherwise
-                (error "encountered the non-standard lambda list keyword ~S"
-                       x)))
-            (ecase state
-              (required  (incf nrequired))
-              (optional  (incf noptional))
-              (key       (push (parse-key-arg x) keywords)
-                         (push x keyword-parameters))
-              (rest      (incf nrest)))))
-      (when (and restp (zerop nrest))
-        (error "Error in lambda-list:~%~
-                After &REST, a DEFGENERIC lambda-list ~
-                must be followed by at least one variable."))
-      (values nrequired noptional keysp restp allow-other-keys-p
-              (reverse keywords)
-              (reverse keyword-parameters)))))
+  (multiple-value-bind (llks required optional rest keywords)
+      ;; We say "&MUMBLE is not allowed in a generic function lambda list"
+      ;; whether this is called by DEFMETHOD or DEFGENERIC.
+      ;; [It is used for either. Why else recognize and silently ignore &AUX?]
+      (parse-lambda-list lambda-list
+                         :accept (lambda-list-keyword-mask
+                                    '(&optional &rest &key &allow-other-keys &aux))
+                         :silent t
+                         :context "a generic function lambda list")
+    (declare (ignore rest))
+    (values llks (length required) (length optional)
+            (mapcar #'parse-key-arg-spec keywords) keywords)))
 
-(defun keyword-spec-name (x)
-  (let ((key (if (atom x) x (car x))))
-    (if (atom key)
-        (keywordicate key)
-        (car key))))
-
+;; FIXME: this does more than return an FTYPE from a lambda list -
+;; it unions the type with an existing ctype object. It needs a better name,
+;; and to be reimplemented as "union and call sb-c::ftype-from-lambda-list".
 (defun ftype-declaration-from-lambda-list (lambda-list name)
-  (multiple-value-bind (nrequired noptional keysp restp allow-other-keys-p
-                                  keywords keyword-parameters)
+  (multiple-value-bind (llks nrequired noptional keywords keyword-parameters)
       (analyze-lambda-list lambda-list)
     (declare (ignore keyword-parameters))
     (let* ((old (info :function :type name)) ;FIXME:FDOCUMENTATION instead?
@@ -1697,19 +1658,19 @@ bootstrapping.
            (old-keysp (and old-ftype (fun-type-keyp old-ftype)))
            (old-allowp (and old-ftype
                             (fun-type-allowp old-ftype)))
-           (keywords (union old-keys (mapcar #'keyword-spec-name keywords))))
+           (keywords (union old-keys (mapcar #'parse-key-arg-spec keywords))))
       `(function ,(append (make-list nrequired :initial-element t)
                           (when (plusp noptional)
                             (append '(&optional)
                                     (make-list noptional :initial-element t)))
-                          (when (or restp old-restp)
+                          (when (or (ll-kwds-restp llks) old-restp)
                             '(&rest t))
-                          (when (or keysp old-keysp)
+                          (when (or (ll-kwds-keyp llks) old-keysp)
                             (append '(&key)
                                     (mapcar (lambda (key)
                                               `(,key t))
                                             keywords)
-                                    (when (or allow-other-keys-p old-allowp)
+                                    (when (or (ll-kwds-allowp llks) old-allowp)
                                       '(&allow-other-keys)))))
                  *))))
 
@@ -1823,6 +1784,9 @@ bootstrapping.
         collect (if (consp x) (list (car x)) x)
         if (eq x '&key) do (loop-finish)))
 
+(defun ll-keyp-or-restp (bits)
+  (logtest (lambda-list-keyword-mask '(&key &rest)) bits))
+
 (defun set-arg-info (gf &key new-method (lambda-list nil lambda-list-p)
                         argument-precedence-order)
   (let* ((arg-info (if (eq **boot-state** 'complete)
@@ -1838,7 +1802,7 @@ bootstrapping.
     (when (or lambda-list-p
               (and first-p
                    (eq (arg-info-lambda-list arg-info) :no-lambda-list)))
-      (multiple-value-bind (nreq nopt keysp restp allow-other-keys-p keywords)
+      (multiple-value-bind (llks nreq nopt keywords)
           (analyze-lambda-list lambda-list)
         (when (and methods (not first-p))
           (let ((gf-nreq (arg-info-number-required arg-info))
@@ -1846,7 +1810,7 @@ bootstrapping.
                 (gf-key/rest-p (arg-info-key/rest-p arg-info)))
             (unless (and (= nreq gf-nreq)
                          (= nopt gf-nopt)
-                         (eq (or keysp restp) gf-key/rest-p))
+                         (eq (ll-keyp-or-restp llks) gf-key/rest-p))
               (error "The lambda-list ~S is incompatible with ~
                      existing methods of ~S."
                      lambda-list gf))))
@@ -1860,10 +1824,10 @@ bootstrapping.
                 (compute-precedence lambda-list nreq argument-precedence-order)))
         (setf (arg-info-metatypes arg-info) (make-list nreq))
         (setf (arg-info-number-optional arg-info) nopt)
-        (setf (arg-info-key/rest-p arg-info) (not (null (or keysp restp))))
+        (setf (arg-info-key/rest-p arg-info) (ll-keyp-or-restp llks))
         (setf (arg-info-keys arg-info)
               (if lambda-list-p
-                  (if allow-other-keys-p t keywords)
+                  (if (ll-kwds-allowp llks) t keywords)
                   (arg-info-key/rest-p arg-info)))))
     (when new-method
       (check-method-arg-info gf arg-info new-method))
@@ -1871,7 +1835,7 @@ bootstrapping.
     arg-info))
 
 (defun check-method-arg-info (gf arg-info method)
-  (multiple-value-bind (nreq nopt keysp restp allow-other-keys-p keywords)
+  (multiple-value-bind (llks nreq nopt keywords)
       (analyze-lambda-list (if (consp method)
                                (early-method-lambda-list method)
                                (method-lambda-list method)))
@@ -1895,13 +1859,13 @@ bootstrapping.
           (lose
            "the method has ~A optional arguments than the generic function."
            (comparison-description nopt gf-nopt)))
-        (unless (eq (or keysp restp) gf-key/rest-p)
+        (unless (eq (ll-keyp-or-restp llks) gf-key/rest-p)
           (lose
            "the method and generic function differ in whether they accept~_~
             &REST or &KEY arguments."))
         (when (consp gf-keywords)
-          (unless (or (and restp (not keysp))
-                      allow-other-keys-p
+          (unless (or (and (ll-kwds-restp llks) (not (ll-kwds-keyp llks)))
+                      (ll-kwds-allowp llks)
                       (every (lambda (k) (memq k keywords)) gf-keywords))
             (lose "the method does not accept each of the &KEY arguments~2I~_~
                    ~S."
@@ -2095,7 +2059,6 @@ bootstrapping.
                          'source source-location)
     (!bootstrap-set-slot 'standard-generic-function fin
                          '%documentation documentation)
-    (set-fun-name fin spec)
     (let ((arg-info (make-arg-info)))
       (setf (early-gf-arg-info fin) arg-info)
       (when lambda-list-p
@@ -2538,7 +2501,6 @@ bootstrapping.
                          '(accessor-method-slot-name
                            generic-function-methods
                            method-specializers
-                           specializerp
                            specializer-type
                            specializer-class
                            slot-definition-location
@@ -2548,11 +2510,7 @@ bootstrapping.
                            class-precedence-list
                            slot-boundp-using-class
                            (setf slot-value-using-class)
-                           slot-value-using-class
-                           structure-class-p
-                           standard-class-p
-                           funcallable-standard-class-p
-                           specializerp)))
+                           slot-value-using-class)))
       (/show spec)
       (setq *!early-generic-functions*
             (cons spec
@@ -2632,116 +2590,42 @@ bootstrapping.
            (unparse-specializer-using-class generic-function spec)))
     (mapcar #'unparse specializers)))
 
-(defun extract-parameters (specialized-lambda-list)
-  (multiple-value-bind (parameters ignore1 ignore2)
-      (parse-specialized-lambda-list specialized-lambda-list)
-    (declare (ignore ignore1 ignore2))
-    parameters))
-
-(defun extract-lambda-list (specialized-lambda-list)
-  (multiple-value-bind (ignore1 lambda-list ignore2)
-      (parse-specialized-lambda-list specialized-lambda-list)
-    (declare (ignore ignore1 ignore2))
-    lambda-list))
-
-(defun extract-specializer-names (specialized-lambda-list)
-  (multiple-value-bind (ignore1 ignore2 specializers)
-      (parse-specialized-lambda-list specialized-lambda-list)
-    (declare (ignore ignore1 ignore2))
-    specializers))
-
-(defun extract-required-parameters (specialized-lambda-list)
-  (multiple-value-bind (ignore1 ignore2 ignore3 required-parameters)
-      (parse-specialized-lambda-list specialized-lambda-list)
-    (declare (ignore ignore1 ignore2 ignore3))
-    required-parameters))
+(macrolet ((def (n name)
+             `(defun ,name (lambda-list)
+                (nth-value ,n (parse-specialized-lambda-list lambda-list)))))
+  ;; We don't need these, but according to the unit tests,
+  ;; they're mandated by AMOP.
+  (def 1 extract-lambda-list)
+  (def 2 extract-specializer-names))
 
 (define-condition specialized-lambda-list-error
     (reference-condition simple-program-error)
   ()
   (:default-initargs :references (list '(:ansi-cl :section (3 4 3)))))
 
-(defun parse-specialized-lambda-list
-    (arglist
-     &optional supplied-keywords (allowed-keywords '(&optional &rest &key &aux))
-     &aux (specialized-lambda-list-keywords
-           '(&optional &rest &key &allow-other-keys &aux)))
-  (let ((arg (car arglist)))
-    (cond ((null arglist) (values nil nil nil nil))
-          ((eq arg '&aux)
-           (values nil arglist nil nil))
-          ((memq arg lambda-list-keywords)
-           ;; non-standard lambda-list-keywords are errors.
-           (unless (memq arg specialized-lambda-list-keywords)
-             (error 'specialized-lambda-list-error
-                    :format-control "unknown specialized-lambda-list ~
-                                     keyword ~S~%"
-                    :format-arguments (list arg)))
-           ;; no multiple &rest x &rest bla specifying
-           (when (memq arg supplied-keywords)
-             (error 'specialized-lambda-list-error
-                    :format-control "multiple occurrence of ~
-                                     specialized-lambda-list keyword ~S~%"
-                    :format-arguments (list arg)))
-           ;; And no placing &key in front of &optional, either.
-           (unless (memq arg allowed-keywords)
-             (error 'specialized-lambda-list-error
-                    :format-control "misplaced specialized-lambda-list ~
-                                     keyword ~S~%"
-                    :format-arguments (list arg)))
-           ;; When we are at a lambda-list keyword, the parameters
-           ;; don't include the lambda-list keyword; the lambda-list
-           ;; does include the lambda-list keyword; and no
-           ;; specializers are allowed to follow the lambda-list
-           ;; keywords (at least for now).
-           (multiple-value-bind (parameters lambda-list)
-               (parse-specialized-lambda-list (cdr arglist)
-                                              (cons arg supplied-keywords)
-                                              (if (eq arg '&key)
-                                                  (cons '&allow-other-keys
-                                                        (cdr (member arg allowed-keywords)))
-                                                (cdr (member arg allowed-keywords))))
-             (when (and (eq arg '&rest)
-                        (or (null lambda-list)
-                            (memq (car lambda-list)
-                                  specialized-lambda-list-keywords)
-                            (not (or (null (cadr lambda-list))
-                                     (memq (cadr lambda-list)
-                                           specialized-lambda-list-keywords)))))
-               (error 'specialized-lambda-list-error
-                      :format-control
-                      "in a specialized-lambda-list, excactly one ~
-                       variable must follow &REST.~%"
-                      :format-arguments nil))
-             (values parameters
-                     (cons arg lambda-list)
-                     ()
-                     ())))
-          (supplied-keywords
-           ;; After a lambda-list keyword there can be no specializers.
-           (multiple-value-bind (parameters lambda-list)
-               (parse-specialized-lambda-list (cdr arglist)
-                                              supplied-keywords
-                                              allowed-keywords)
-             (values (cons (if (listp arg) (car arg) arg) parameters)
-                     (cons arg lambda-list)
-                     ()
-                     ())))
-          (t
-           (multiple-value-bind (parameters lambda-list specializers required)
-               (parse-specialized-lambda-list (cdr arglist))
-             ;; Check for valid arguments.
-             (unless (or (and (symbolp arg) (not (null arg)))
-                         (and (consp arg)
-                              (consp (cdr arg))
-                              (null (cddr arg))))
-               (error 'specialized-lambda-list-error
-                      :format-control "arg is not a non-NIL symbol or a list of two elements: ~A"
-                      :format-arguments (list arg)))
-             (values (cons (if (listp arg) (car arg) arg) parameters)
-                     (cons (if (listp arg) (car arg) arg) lambda-list)
-                     (cons (if (listp arg) (cadr arg) t) specializers)
-                     (cons (if (listp arg) (car arg) arg) required)))))))
+;; Return 3 values:
+;; - the bound variables, without defaults, supplied-p vars, or &AUX vars.
+;; - the lambda list without specializers.
+;; - just the specializers
+(defun parse-specialized-lambda-list (arglist)
+  (multiple-value-bind (llks specialized optional rest key aux)
+      (parse-lambda-list
+       arglist
+       :context 'defmethod
+       :accept (lambda-list-keyword-mask
+                '(&optional &rest &key &allow-other-keys &aux))
+       :silent t ; never signal &OPTIONAL + &KEY style-warning
+       :condition-class 'specialized-lambda-list-error)
+    (let ((required (mapcar (lambda (x) (if (listp x) (car x) x)) specialized)))
+      (values (append required
+                      (mapcar #'parse-optional-arg-spec optional)
+                      rest
+                      ;; Preserve keyword-names when given as (:KEYWORD var)
+                      (mapcar (lambda (x) (if (typep x '(cons cons))
+                                              (car x)
+                                              (parse-key-arg-spec x))) key))
+              (make-lambda-list llks nil required optional rest key aux)
+              (mapcar (lambda (x) (if (listp x) (cadr x) t)) specialized)))))
 
 (setq **boot-state** 'early)
 

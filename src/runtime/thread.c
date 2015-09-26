@@ -688,8 +688,6 @@ create_thread_struct(lispobj initial_function) {
          ALIEN_STACK_SIZE);
     per_thread=(union per_thread_data *)
         (csp_page + THREAD_CSP_PAGE_SIZE);
-    struct nonpointer_thread_data *nonpointer_data
-        = (void *) &per_thread->dynamic_values[TLS_SIZE];
 
 #ifdef LISP_FEATURE_SB_THREAD
     for(i = 0; i < (dynamic_values_bytes / sizeof(lispobj)); i++)
@@ -725,17 +723,20 @@ create_thread_struct(lispobj initial_function) {
      * nonpointer data, because it's used for post_mortem and freed
      * separately */
     th->os_attr=malloc(sizeof(pthread_attr_t));
-    th->nonpointer_data = nonpointer_data;
 # ifndef LISP_FEATURE_SB_SAFEPOINT
+    struct nonpointer_thread_data *nonpointer_data
+      = (void *) &per_thread->dynamic_values[TLS_SIZE];
+
     th->state_sem=&nonpointer_data->state_sem;
     th->state_not_running_sem=&nonpointer_data->state_not_running_sem;
     th->state_not_stopped_sem=&nonpointer_data->state_not_stopped_sem;
     os_sem_init(th->state_sem, 1);
     os_sem_init(th->state_not_running_sem, 0);
     os_sem_init(th->state_not_stopped_sem, 0);
-# endif
     th->state_not_running_waitcount = 0;
     th->state_not_stopped_waitcount = 0;
+# endif
+
 #endif
     th->state=STATE_RUNNING;
 #ifdef ALIEN_STACK_GROWS_DOWNWARD
@@ -779,8 +780,8 @@ create_thread_struct(lispobj initial_function) {
     SetSymbolValue(PSEUDO_ATOMIC_BITS,(lispobj)th->pseudo_atomic_bits,th);
 #endif
 #ifdef PSEUDO_ATOMIC_INTERRUPTED
-    SetSymbolValue(PSEUDO_ATOMIC_ATOMIC,NIL,th);
-    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED,NIL,th);
+    clear_pseudo_atomic_atomic(th);
+    clear_pseudo_atomic_interrupted(th);
 #endif
 #endif
     bind_variable(CURRENT_CATCH_BLOCK,make_fixnum(0),th);
@@ -834,7 +835,7 @@ create_thread_struct(lispobj initial_function) {
     }
     th->synchronous_io_handle_and_flag = 0;
 #endif
-    th->stepping = NIL;
+    th->stepping = 0;
     return th;
 }
 

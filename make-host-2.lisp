@@ -11,6 +11,21 @@
 (load "src/cold/defun-load-or-cload-xcompiler.lisp")
 (load-or-cload-xcompiler #'host-load-stem)
 
+(let ((*features* (cons :sb-xc *features*)))
+  (load "src/cold/muffler.lisp"))
+
+;; Avoid forward-reference to an as-yet unknown type.
+;; NB: This is not how you would write this function, if you required
+;; such a thing. It should be (TYPEP X 'CODE-DELETION-NOTE).
+;; Do as I say, not as I do.
+(defun code-deletion-note-p (x)
+  (eq (type-of x) 'sb!ext:code-deletion-note))
+(setq sb!c::*handled-conditions*
+      `((,(sb!kernel:specifier-type
+           '(or (satisfies unable-to-optimize-note-p)
+                (satisfies code-deletion-note-p)))
+         . muffle-warning)))
+
 (defun proclaim-target-optimization ()
   (let ((debug (if (position :sb-show *shebang-features*) 2 1)))
     (sb-xc:proclaim
@@ -119,7 +134,7 @@
   (loop for (type-spec . (count . interr-p)) in l
         do (format t "~:[ ~;+~] ~5D ~S~%" interr-p count type-spec))
   (format t "~&Error numbers not used by checkgen:~%")
-  (loop for (spec . symbol) across sb!c::*backend-internal-errors*
+  (loop for (spec . symbol) across sb!c:+backend-internal-errors+
         when (and (not (stringp spec))
                   (not (gethash spec sb!c::*checkgen-used-types*)))
         do (format t "       ~S~%" spec)))

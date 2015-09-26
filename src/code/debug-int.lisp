@@ -632,10 +632,7 @@
   (multiple-value-bind (saved-fp saved-pc)
       (sb!alien-internals:find-saved-fp-and-pc fp)
     (when saved-fp
-      (compute-calling-frame (descriptor-sap saved-fp)
-                             (descriptor-sap saved-pc)
-                             up-frame
-                             t))))
+      (compute-calling-frame saved-fp saved-pc up-frame t))))
 
 ;;; Return the frame immediately below FRAME on the stack; or when
 ;;; FRAME is the bottom of the stack, return NIL.
@@ -650,16 +647,23 @@
           (setf (frame-%down frame)
                 (etypecase debug-fun
                   (compiled-debug-fun
-                   (let ((c-d-f (compiled-debug-fun-compiler-debug-fun
+                   (let (#!-fp-and-pc-standard-save
+                         (c-d-f (compiled-debug-fun-compiler-debug-fun
                                  debug-fun)))
                      (compute-calling-frame
                       (descriptor-sap
                        (get-context-value
                         frame ocfp-save-offset
-                        (sb!c::compiled-debug-fun-old-fp c-d-f)))
+                        #!-fp-and-pc-standard-save
+                        (sb!c::compiled-debug-fun-old-fp c-d-f)
+                        #!+fp-and-pc-standard-save
+                        sb!c:old-fp-passing-offset))
                       (get-context-value
                        frame lra-save-offset
-                       (sb!c::compiled-debug-fun-return-pc c-d-f))
+                       #!-fp-and-pc-standard-save
+                       (sb!c::compiled-debug-fun-return-pc c-d-f)
+                       #!+fp-and-pc-standard-save
+                       sb!c:return-pc-passing-offset)
                       frame)))
                   (bogus-debug-fun
                    (let ((fp (frame-pointer frame)))
@@ -1256,9 +1260,10 @@ register."
   (when (and (compiled-frame-p frame)
              (compiled-frame-escaped frame)
              sb!kernel::*current-internal-error*
-             (array-in-bounds-p sb!c:*backend-internal-errors*
+             (array-in-bounds-p sb!c:+backend-internal-errors+
                                 sb!kernel::*current-internal-error*))
-    (cdr (svref sb!c:*backend-internal-errors* sb!kernel::*current-internal-error*))))
+    (cdr (svref sb!c:+backend-internal-errors+
+                sb!kernel::*current-internal-error*))))
 
 (defun tl-invalid-arg-count-error-p (frame)
   (and (eq (interrupted-frame-error frame)
@@ -2074,7 +2079,7 @@ register."
        ;; fixnum
        (zerop (logand val sb!vm:fixnum-tag-mask))
        ;; immediate single float, 64-bit only
-       #!+#.(cl:if (cl:= sb!vm::n-machine-word-bits 64) '(and) '(or))
+       #!+64-bit
        (= (logand val #xff) sb!vm:single-float-widetag)
        ;; character
        (and (zerop (logandc2 val #x1fffffff)) ; Top bits zero
@@ -2240,7 +2245,15 @@ register."
          (signed-sap-ref-word nfp (stack-frame-offset 1 0))))
       (#.sb!vm:sap-stack-sc-number
        (with-nfp (nfp)
-         (sap-ref-sap nfp (stack-frame-offset 1 0)))))))
+         (sap-ref-sap nfp (stack-frame-offset 1 0))))
+      (#.constant-sc-number
+       (if escaped
+           (code-header-ref
+            (component-from-component-ptr
+             (component-ptr-from-pc
+              (sb!vm:context-pc escaped)))
+            (sb!c:sc-offset-offset sc-offset))
+           :invalid-value-for-unescaped-register-storage)))))
 
 ;;; This stores value as the value of DEBUG-VAR in FRAME. In the
 ;;; COMPILED-DEBUG-VAR case, access the current value to determine if
@@ -2538,6 +2551,8 @@ register."
 ;;; The vector elements are in the same format as the compiler's
 ;;; NODE-SOURCE-PATH; that is, the first element is the form number and
 ;;; the last is the TOPLEVEL-FORM number.
+;;;
+;;; This should be synchronized with SB-C::SUB-FIND-SOURCE-PATHS
 (defun form-number-translations (form tlf-number)
   (let ((seen nil)
         (translations (make-array 12 :fill-pointer 0 :adjustable t)))
@@ -2554,8 +2569,13 @@ register."
                                 '(progn
                                   (when (atom subform) (return))
                                   (let ((fm (car subform)))
-                                    (when (consp fm)
-                                      (translate1 fm (cons pos path)))
+                                    (when (sb!int:comma-p fm)
+                                      (setf fm (sb!int:comma-expr fm)))
+                                    (cond ((consp fm)
+                                           (translate1 fm (cons pos path)))
+                                          ((eq 'quote fm)
+                                           ;; Don't look into quoted constants.
+                                           (return)))
                                     (incf pos))
                                   (setq subform (cdr subform))
                                   (when (eq subform trail) (return)))))
@@ -2858,8 +2878,11 @@ register."
     (declare (ignore breakpoint)
              (type frame frame))
     (let ((lra-sc-offset
-           (sb!c::compiled-debug-fun-return-pc
-            (compiled-debug-fun-compiler-debug-fun debug-fun))))
+            #!-fp-and-pc-standard-save
+            (sb!c::compiled-debug-fun-return-pc
+             (compiled-debug-fun-compiler-debug-fun debug-fun))
+            #!+fp-and-pc-standard-save
+            sb!c:return-pc-passing-offset))
       (multiple-value-bind (lra component offset)
           (make-bogus-lra
            (get-context-value frame
@@ -2892,9 +2915,13 @@ register."
 ;;; series of cookies is valid.
 (defun fun-end-cookie-valid-p (frame cookie)
   (let ((lra (fun-end-cookie-bogus-lra cookie))
-        (lra-sc-offset (sb!c::compiled-debug-fun-return-pc
-                        (compiled-debug-fun-compiler-debug-fun
-                         (fun-end-cookie-debug-fun cookie)))))
+        (lra-sc-offset
+          #!-fp-and-pc-standard-save
+          (sb!c::compiled-debug-fun-return-pc
+           (compiled-debug-fun-compiler-debug-fun
+            (fun-end-cookie-debug-fun cookie)))
+          #!+fp-and-pc-standard-save
+          sb!c:return-pc-passing-offset))
     (do ((frame frame (frame-down frame)))
         ((not frame) nil)
       (when (and (compiled-frame-p frame)
@@ -3420,8 +3447,8 @@ register."
                                   args)))
                     ;; Signal a step condition
                     (let* ((step-in
-                            (let ((*step-frame* (frame-down (top-frame))))
-                              (sb!impl::step-form step-info args))))
+                             (let ((*step-frame* (frame-down (top-frame))))
+                               (sb!impl::step-form step-info args))))
                       ;; And proceed based on its return value.
                       (if step-in
                           ;; STEP-INTO was selected. Use *STEP-OUT* to
@@ -3452,8 +3479,14 @@ register."
                             fdefn))
                          (function fun))))
       ;; And then store the wrapper in the same place.
-      (setf (context-register context callee-register-offset)
-            (get-lisp-obj-address new-callee)))))
+      (with-pinned-objects (new-callee)
+        ;; %SET-CONTEXT-REGISTER is a function, so the address of
+        ;; NEW-CALLEE gets converted to a fixnum before passing, which
+        ;; won't keep NEW-CALLEE pinned down. Once it's inside
+        ;; CONTEXT, which is registered in thread->interrupt_contexts,
+        ;; it will properly point to NEW-CALLEE.
+        (setf (context-register context callee-register-offset)
+              (get-lisp-obj-address new-callee))))))
 
 ;;; Given a signal context, fetch the step-info that's been stored in
 ;;; the debug info at the trap point.

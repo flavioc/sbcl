@@ -40,13 +40,12 @@
 ;;;;  (incf (buffer-tail buffer) n))
 ;;;;
 
-(declaim (inline buffer-sap buffer-length buffer-head buffer-tail
-                 (setf buffer-head) (setf buffer-tail)))
 (defstruct (buffer (:constructor %make-buffer (sap length)))
   (sap (missing-arg) :type system-area-pointer :read-only t)
   (length (missing-arg) :type index :read-only t)
   (head 0 :type index)
   (tail 0 :type index))
+(declaim (freeze-type buffer))
 
 (defvar *available-buffers* ()
   #!+sb-doc
@@ -220,6 +219,21 @@
   ;; we can note the position at the first "good" character.
   (form-start-byte-pos)
   (form-start-char-pos))
+
+(defun line/col-from-charpos
+    (stream &optional (charpos (ansi-stream-input-char-pos stream)))
+  (let* ((newlines (form-tracking-stream-newlines stream))
+         (index (position charpos newlines :test #'>= :from-end t)))
+    ;; Line numbers traditionally begin at 1, columns at 0.
+    (if index
+        ;; INDEX is 1 less than the number of newlines seen
+        ;; up to and including this startpos.
+        ;; e.g. index=0 => 1 newline seen => line=2
+        (cons (+ index 2)
+              ;; 1 char after the newline = column 0
+              (- charpos (aref newlines index) 1))
+        ;; zero newlines were seen
+        (cons 1 charpos))))
 
 ;;;; CORE OUTPUT FUNCTIONS
 
@@ -716,7 +730,7 @@
   (setf (signed-sap-ref-32 (buffer-sap obuf) tail)
         byte))
 
-#+#.(cl:if (cl:= sb!vm:n-word-bits 64) '(and) '(or))
+#!+64-bit
 (progn
   (def-output-routines ("OUTPUT-UNSIGNED-LONG-LONG-~A-BUFFERED"
                         8
@@ -1224,7 +1238,7 @@
                    ((signed-byte 32) 4 sap head)
   (signed-sap-ref-32 sap head))
 
-#+#.(cl:if (cl:= sb!vm:n-word-bits 64) '(and) '(or))
+#!+64-bit
 (progn
   (def-input-routine input-unsigned-64bit-byte
       ((unsigned-byte 64) 8 sap head)
@@ -2193,7 +2207,7 @@
            (let ((posn (sb!unix:unix-lseek (fd-stream-fd stream)
                                            offset origin)))
              ;; CLHS says to return true if the file-position was set
-             ;; succesfully, and NIL otherwise. We are to signal an error
+             ;; successfully, and NIL otherwise. We are to signal an error
              ;; only if the given position was out of bounds, and that is
              ;; dealt with above. In times past we used to return NIL for
              ;; errno==ESPIPE, and signal an error in other cases.

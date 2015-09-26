@@ -670,3 +670,18 @@
                      `(lambda (x y)
                         (deposit-field 0 (byte x y) 100)))
             -1 -2)))
+
+(with-test (:name :setf-mask-field)
+  (assert (= (funcall
+              (compile nil
+                       `(lambda (a)
+                          (setf (mask-field (byte 2 0) a) 1) a))
+              15))))
+
+(with-test (:name :complex-multiply)
+  (assert (= (funcall
+              (compile nil `(lambda ()
+                              (declare (optimize speed))
+                              (let (z)
+                                (expt (setf z (complex -0.123 -0.789)) 2)))))
+             #C(-0.60739195 0.194094))))

@@ -51,18 +51,24 @@
         #+sb-package-locks (sb-ext:unlock-package package)))))
 
 ;; Reinstate the pre-cold-init variable-defining macros.
-(macrolet ((def (wrapper real-name)
-             `(defmacro ,wrapper (&rest args) `(,',real-name ,@args))))
-  (def sb-impl::!defglobal defglobal)
-  (def sb-impl::!defparameter defparameter)
-  (def sb-impl::!defvar defvar))
+(let ((*package* (find-package "SB-INT")))
+  (flet ((def (real-name)
+           (let ((alias (sb-int:symbolicate "!" real-name)))
+             (export alias)
+             (setf (macro-function alias) (macro-function real-name)))))
+    (def 'sb-ext:defglobal)
+    (def 'defparameter)
+    (def 'defvar)))
 
 (export '(sb-int::def!method
+          sb-int::!cold-init-forms
           sb-int::!coerce-to-specialized
           sb-int::!uncross-format-control)
         'sb-int)
 
 (setf (macro-function 'sb-int:def!method) (macro-function 'defmethod))
+
+(defmacro sb-int:!cold-init-forms (&rest forms) `(progn ,@forms))
 
 ;; This macro is never defined for the target Lisp,
 ;; only the cross-compilation host (see "src/code/specializable-array")

@@ -185,6 +185,7 @@ evaluated as a PROGN."
   (multiple-value-bind (forms decls doc) (parse-body body)
     (let* (;; stuff shared between LAMBDA and INLINE-LAMBDA and NAMED-LAMBDA
            (lambda-guts `(,args
+                          ,@(when doc (list doc))
                           ,@decls
                           (block ,(fun-name-block-name name)
                             ,@forms)))
@@ -206,13 +207,13 @@ evaluated as a PROGN."
          ,@(when (typep name '(cons (eql setf)))
              `((eval-when (:compile-toplevel :execute)
                  (sb!c::warn-if-setf-macro ',name))))
-         (%defun ',name ,named-lambda ,doc ',inline-lambda
-                 (sb!c:source-location))))))
+         (%defun ',name ,named-lambda (sb!c:source-location)
+                 ,@(and inline-lambda
+                        `(',inline-lambda)))))))
 
 #-sb-xc-host
-(progn (defun %defun (name def doc inline-lambda source-location)
+(progn (defun %defun (name def source-location &optional inline-lambda)
           (declare (type function def))
-          (declare (type (or null simple-string) doc))
           ;; should've been checked by DEFMACRO DEFUN
           (aver (legal-fun-name-p name))
           (sb!c:%compiler-defun name inline-lambda nil)
@@ -226,16 +227,13 @@ evaluated as a PROGN."
   ;; we frob any existing inline expansions.
           (sb!c::%set-inline-expansion name nil inline-lambda)
           (sb!c::note-name-defined name :function)
-          (when doc
-            (setf (%fun-doc def) doc))
           name)
        ;; During cold-init we don't touch the fdefinition.
-       (defun !%quietly-defun (name doc inline-lambda)
+       (defun !%quietly-defun (name inline-lambda)
          (sb!c:%compiler-defun name nil nil) ; makes :WHERE-FROM = :DEFINED
          (sb!c::%set-inline-expansion name nil inline-lambda)
          ;; and no need to call NOTE-NAME-DEFINED. It would do nothing.
-         (when doc
-           (setf (%fun-doc (fdefinition name)) doc))))
+         ))
 
 ;;;; DEFVAR and DEFPARAMETER
 
@@ -248,9 +246,12 @@ evaluated as a PROGN."
   `(progn
      (eval-when (:compile-toplevel)
        (%compiler-defvar ',var))
-     (%defvar ',var (unless (boundp ',var) ,val)
-              ',valp ,doc ',docp
-              (sb!c:source-location))))
+     (%defvar ',var
+              (sb!c:source-location)
+              ,@(and valp
+                     `((unless (boundp ',var) ,val)))
+              ,@(and docp
+                     `(,doc)))))
 
 (defmacro-mundanely defparameter (var val &optional (doc nil docp))
   #!+sb-doc
@@ -262,17 +263,19 @@ evaluated as a PROGN."
   `(progn
      (eval-when (:compile-toplevel)
        (%compiler-defvar ',var))
-     (%defparameter ',var ,val ,doc ',docp (sb!c:source-location))))
+     (%defparameter ',var ,val (sb!c:source-location)
+                    ,@(and docp
+                           `(,doc)))))
 
 (defun %compiler-defvar (var)
   (sb!xc:proclaim `(special ,var)))
 
 #-sb-xc-host
-(defun %defvar (var val valp doc docp source-location)
+(defun %defvar (var source-location &optional (val nil valp) (doc nil docp))
   (%compiler-defvar var)
-  (when valp
-    (unless (boundp var)
-      (set var val)))
+  (when (and valp
+             (not (boundp var)))
+    (set var val))
   (when docp
     (setf (fdocumentation var 'variable) doc))
   (sb!c:with-source-location (source-location)
@@ -280,7 +283,7 @@ evaluated as a PROGN."
   var)
 
 #-sb-xc-host
-(defun %defparameter (var val doc docp source-location)
+(defun %defparameter (var val source-location &optional (doc nil docp))
   (%compiler-defvar var)
   (set var val)
   (when docp
@@ -421,7 +424,8 @@ evaluated as a PROGN."
    RESTARTS-FORM are associated with the condition returned by CONDITION-FORM.
    This allows FIND-RESTART, etc., to recognize restarts that are not related
    to the error currently being debugged. See also RESTART-CASE."
-  (once-only ((restarts restarts-form))
+  (once-only ((condition-form condition-form)
+              (restarts restarts-form))
     (with-unique-names (restart)
       ;; FIXME: check the need for interrupt-safety.
       `(unwind-protect
@@ -604,51 +608,128 @@ evaluated as a PROGN."
                   (format ,stream ,format-string ,@format-arguments))
         (values nil t)))))
 
-(defmacro-mundanely %handler-bind (bindings form)
+(defmacro-mundanely %handler-bind (bindings form &environment env)
+  (unless bindings
+    (return-from %handler-bind form))
   ;; As an optimization, this looks at the handler parts of BINDINGS
   ;; and turns handlers of the forms (lambda ...) and (function
   ;; (lambda ...)) into local, dynamic-extent functions.
   ;;
-  ;; Type specifiers in BINDINGS are translated into local,
-  ;; dynamic-extent functions to allow TYPEP optimizations.
-  (let ((local-functions '())
-        (cluster-entries '()))
-    (labels ((local-function (lambda-form &optional name)
-               (let ((name (sb!xc:gensym name)))
-                 (push `(,name ,@(rest lambda-form)) local-functions)
-                 name))
-             (entry-form (type handler)
-               (let ((name (local-function
-                            `(lambda (condition)
-                               (typep condition ',type))
-                            "TYPEP")))
-                 `(cons (function ,name) ,handler)))
-             (local-function-handler (type lambda-form)
-               (let ((name (local-function lambda-form "HANDLER")))
-                 (push (entry-form type `(function ,name)) cluster-entries)))
-             (process-binding (binding)
-               (unless (proper-list-of-length-p binding 2)
-                 (error "ill-formed handler binding: ~S" binding))
-               (destructuring-bind (type handler) binding
-                 (typecase handler
-                   ((cons (eql lambda) t)
-                    (local-function-handler type handler))
-                   ((cons (eql function)
-                          (cons (cons (eql lambda) t) t))
-                    (local-function-handler type (second handler)))
-                   (t
-                    (push (apply #'entry-form binding) cluster-entries))))))
-      (cond
-        ((not bindings)
-         form)
-        (t
-         (mapc #'process-binding bindings)
-         `(dx-flet (,@(reverse local-functions))
-            (let ((*handler-clusters*
-                   (list* (list ,@(nreverse cluster-entries)) *handler-clusters*)))
-              #!+stack-allocatable-fixed-objects
-              (declare (truly-dynamic-extent *handler-clusters*))
-              (progn ,form))))))))
+  ;; Type specifiers in BINDINGS which name classoids are parsed
+  ;; into the classoid, otherwise are translated local TYPEP wrappers.
+  ;;
+  ;; As a further optimization, it is possible to eliminate some runtime
+  ;; consing (which is a speed win if not a space win, since it's dx already)
+  ;; in special cases such as (HANDLER-BIND ((WARNING #'MUFFLE-WARNING)) ...).
+  ;; If all bindings are optimizable, then the runtime cost of making them
+  ;; is one dx cons cell for the whole cluster.
+  ;; Otherwise it takes 1+2N cons cells where N is the number of bindings.
+  ;;
+  (collect ((local-functions) (cluster-entries) (dummy-forms))
+    (flet ((const-cons (test handler)
+             ;; If possible, render HANDLER as a load-time constant so that
+             ;; consing the test and handler is also load-time constant.
+             (let ((name (when (typep handler
+                                      '(cons (member function quote)
+                                             (cons symbol null)))
+                           (cadr handler))))
+               (cond ((or (not name)
+                          (assq name (local-functions))
+                          (and (eq (car handler) 'function)
+                               (sb!c::fun-locally-defined-p name env)))
+                      `(cons ,(case (car test)
+                               ((named-lambda function) test)
+                               (t `(load-time-value ,test t)))
+                             ,(if (typep handler '(cons (eql function)))
+                                  handler
+                                  ;; Regardless of lexical policy, never allow
+                                  ;; a non-callable into handler-clusters.
+                                  `(let ((x ,handler))
+                                     (declare (optimize (safety 3)))
+                                     (the callable x)))))
+                     ((info :function :info name) ; known
+                      ;; This takes care of CONTINUE,ABORT,MUFFLE-WARNING.
+                      ;; #' will be evaluated in the null environment.
+                      `(load-time-value (cons ,test #',name) t))
+                     (t
+                      ;; For each handler specified as #'F we must verify
+                      ;; that F is fboundp upon entering the binding scope.
+                      ;; Referencing #'F is enough to ensure a warning if the
+                      ;; function isn't defined at compile-time, but the
+                      ;; compiler considers it elidable unless something forces
+                      ;; an apparent use of the form at runtime,
+                      ;; so instead use SAFE-FDEFN-FUN on the fdefn.
+                      (when (eq (car handler) 'function)
+                        (dummy-forms `(sb!c:safe-fdefn-fun
+                                       (load-time-value
+                                        (find-or-create-fdefn ',name) t))))
+                      ;; Resolve to an fdefn at load-time.
+                      `(load-time-value
+                        (cons ,test (find-or-create-fdefn ',name))
+                        t)))))
+
+           (const-list (items)
+             ;; If the resultant list is (LIST (L-T-V ...) (L-T-V ...) ...)
+             ;; then pull the L-T-V outside.
+             (if (every (lambda (x) (typep x '(cons (eql load-time-value))))
+                        items)
+                 `(load-time-value (list ,@(mapcar #'second items)) t)
+                 `(list ,@items))))
+
+      (dolist (binding bindings)
+        (unless (proper-list-of-length-p binding 2)
+          (error "ill-formed handler binding: ~S" binding))
+        (destructuring-bind (type handler) binding
+          (setq type (typexpand type env))
+          ;; Simplify a singleton AND or OR.
+          (when (typep type '(cons (member and or) (cons t null)))
+            (setf type (second type)))
+          (cluster-entries
+           (const-cons
+            ;; Compute the test expression
+            (cond ((member type '(t condition))
+                   ;; Every signal is necesarily a CONDITION, so whether you
+                   ;; wrote T or CONDITION, this is always an eligible handler.
+                   '#'constantly-t)
+                  ((typep type '(cons (eql satisfies) (cons t null)))
+                   ;; (SATISFIES F) => #'F but never a local definition of F.
+                   ;; The predicate is used only if needed - it's not an error
+                   ;; if not fboundp (though dangerously stupid) - so just
+                   ;; reference #'F for the compiler to see the use of the name.
+                   (let ((name (second type)))
+                     (dummy-forms `#',name)
+                     `(find-or-create-fdefn ',name)))
+                  ((and (symbolp type)
+                        (condition-classoid-p (find-classoid type nil)))
+                   ;; It's debatable whether we need to go through a
+                   ;; classoid-cell instead of just using load-time-value
+                   ;; on FIND-CLASS, but the extra indirection is
+                   ;; safer, and no slower than what TYPEP does.
+                   `(find-classoid-cell ',type :create t))
+                  (t ; No runtime consing here- this is not a closure.
+                   `(named-lambda (%handler-bind ,type) (c)
+                      (declare (optimize (sb!c::verify-arg-count 0)))
+                      (typep c ',type))))
+            ;; Compute the handler expression
+            (let ((lexpr (typecase handler
+                          ((cons (eql lambda)) handler)
+                          ((cons (eql function)
+                                 (cons (cons (eql lambda)) null))
+                           (cadr handler)))))
+              (if lexpr
+                  (let ((name (let ((sb!xc:*gensym-counter*
+                                     (length (cluster-entries))))
+                                (sb!xc:gensym "H"))))
+                    (local-functions `(,name ,@(rest lexpr)))
+                    `#',name)
+                  handler))))))
+
+      `(dx-flet ,(local-functions)
+         ,@(dummy-forms)
+         (dx-let ((*handler-clusters*
+                   (cons ,(const-list (cluster-entries))
+                         *handler-clusters*)))
+           ,form)))))
 
 (defmacro-mundanely handler-bind (bindings &body forms)
   #!+sb-doc
@@ -658,6 +739,11 @@ Executes body in a dynamic context where the given handler bindings are in
 effect. Each handler must take the condition being signalled as an argument.
 The bindings are searched first to last in the event of a signalled
 condition."
+  ;; Bindings which meet specific criteria can be established with
+  ;; slightly less runtime overhead than in general.
+  ;; To allow the optimization, TYPE must be either be (SATISFIES P)
+  ;; or a symbol naming a condition class at compile time,
+  ;; and HANDLER must be a global function specified as either 'F or #'F.
   `(%handler-bind ,bindings
                   #!-x86 (progn ,@forms)
                   ;; Need to catch FP errors here!
@@ -734,22 +820,6 @@ specification."
 
 (defmacro-mundanely return (&optional (value nil))
   `(return-from nil ,value))
-
-(defmacro-mundanely psetq (&rest pairs)
-  #!+sb-doc
-  "PSETQ {var value}*
-   Set the variables to the values, like SETQ, except that assignments
-   happen in parallel, i.e. no assignments take place until all the
-   forms have been evaluated."
-  ;; Given the possibility of symbol-macros, we delegate to PSETF
-  ;; which knows how to deal with them, after checking that syntax is
-  ;; compatible with PSETQ.
-  (do ((pair pairs (cddr pair)))
-      ((endp pair) `(psetf ,@pairs))
-    (unless (symbolp (car pair))
-      (error 'simple-program-error
-             :format-control "variable ~S in PSETQ is not a SYMBOL"
-             :format-arguments (list (car pair))))))
 
 (defmacro-mundanely lambda (&whole whole args &body body)
   (declare (ignore args body))

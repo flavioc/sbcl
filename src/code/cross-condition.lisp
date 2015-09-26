@@ -12,6 +12,16 @@
 (in-package "SB!KERNEL")
 
 (define-condition simple-style-warning (simple-condition style-warning) ())
+(defun style-warn (datum &rest arguments)
+  ;; Cross-compiler needs a special-case for DATUM being a string,
+  ;; because it needs to produce a SIMPLE-STYLE-WARNING, not SIMPLE-WARNING.
+  ;; The SBCL-specific %WARN function - which allows specifying the default
+  ;; condition class when handed a string - exists only on the target lisp.
+  (if (stringp datum)
+      (warn 'simple-style-warning
+            :format-control datum :format-arguments arguments)
+      (apply #'warn datum arguments)))
+
 (define-condition format-too-few-args-warning (simple-warning) ())
 ;;; in the cross-compiler, this is a full warning.  In the target
 ;;; compiler, it will only be a style-warning.
@@ -92,3 +102,12 @@ which can be found at <http://sbcl.sourceforge.net/>.~:@>"
 ;; both of which are specified to exist.
 (define-condition sb!c:inlining-dependency-failure
     (simple-condition style-warning) ())
+
+;; early-extensions seems to want to recognize these types.
+;; I'm not sure that it actually can or needs to. For one thing,
+;; the types didn't used to exist. More than likely the mechanism for handling
+;; deprecated types doesn't actually work in the cross-compiler.
+;; Anyway, the lesser evil is to make a few extra definitions rather than
+;; produce a PARSE-UNKNOWN-TYPE warning in reference to PARSE-UNKNOWN-TYPE.
+(define-condition parse-unknown-type () ())
+(define-condition parse-deprecated-type () ())

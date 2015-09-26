@@ -34,6 +34,9 @@
             "Vector longer than the specified length: #~S~S."
             length list))
           (length
+           (when (and (plusp length) (null list))
+             (simple-reader-error
+              stream "Vector of length ~D can't be initialized from ()" length))
            ;; the syntax `#n(foo ,@bar) is not well-defined. [See lp#1096043.]
            ;; We take it to mean that the vector as read should be padded to
            ;; length 'n'. It could be argued that 'n' is the length after
@@ -342,24 +345,17 @@
 
 ;;;; conditional compilation: the #+ and #- readmacros
 
-(flet ((guts (stream not-p)
-         (unless (if (let ((*package* *keyword-package*)
-                           (*reader-package* nil)
-                           (*read-suppress* nil))
-                       (featurep (read stream t nil t)))
-                     (not not-p)
-                     not-p)
-           (let ((*read-suppress* t))
-             (read stream t nil t)))
-         (values)))
-
-  (defun sharp-plus (stream sub-char numarg)
+(defun sharp-plus-minus (stream sub-char numarg)
     (ignore-numarg sub-char numarg)
-    (guts stream nil))
-
-  (defun sharp-minus (stream sub-char numarg)
-    (ignore-numarg sub-char numarg)
-    (guts stream t)))
+    (if (char= (if (featurep (let ((*package* *keyword-package*)
+                                   (*reader-package* nil)
+                                   (*read-suppress* nil))
+                               (read stream t nil t)))
+                   #\+ #\-) sub-char)
+        (read stream t nil t)
+        (let ((*read-suppress* t))
+          (read stream t nil t)
+          (values))))
 
 ;;;; reading miscellaneous objects: the #P, #\, and #| readmacros
 
@@ -505,8 +501,8 @@
   (set-dispatch-macro-character #\# #\s #'sharp-S)
   (set-dispatch-macro-character #\# #\= #'sharp-equal)
   (set-dispatch-macro-character #\# #\# #'sharp-sharp)
-  (set-dispatch-macro-character #\# #\+ #'sharp-plus)
-  (set-dispatch-macro-character #\# #\- #'sharp-minus)
+  (set-dispatch-macro-character #\# #\+ #'sharp-plus-minus)
+  (set-dispatch-macro-character #\# #\- #'sharp-plus-minus)
   (set-dispatch-macro-character #\# #\c #'sharp-C)
   (set-dispatch-macro-character #\# #\| #'sharp-vertical-bar)
   (set-dispatch-macro-character #\# #\p #'sharp-P)

@@ -13,15 +13,5 @@
   #!+sb-doc
   "Bind the variables in LAMBDA-LIST to the corresponding values in the
 tree structure resulting from the evaluation of EXPRESSION."
-  (let ((whole-name (gensym "WHOLE")))
-    (multiple-value-bind (body local-decls)
-        (parse-defmacro lambda-list whole-name body nil 'destructuring-bind
-                        :anonymousp t
-                        :doc-string-allowed nil
-                        :wrap-block nil)
-      `(let ((,whole-name ,expression))
-         ;; This declaration-as-assertion should protect us from
-         ;; (DESTRUCTURING-BIND (X . Y) 'NOT-A-LIST ...).
-         (declare (type list ,whole-name))
-         ,@local-decls
-         ,body))))
+  `(binding* ,(sb!c::expand-ds-bind lambda-list expression t nil)
+             ,@body))

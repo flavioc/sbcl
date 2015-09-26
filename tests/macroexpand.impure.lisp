@@ -76,6 +76,7 @@
                      (write-to-string e :escape nil))))
   (:no-error () (error "Expected an error")))
 
+(with-test (:name :binding*-expander)
 (assert (equal (macroexpand-1
                 '(sb-int:binding* (((foo x bar zz) (f) :exit-if-null)
                                    ((baz y) (g bar)))
@@ -98,3 +99,106 @@
                  (LET* ((X (G Y X)))
                    (DECLARE (INTEGER X))
                    (FOO)))))
+
+;; The conversion of a trailing sequence of individual bindings
+;; into one LET* failed to remove declarations that were already
+;; injected pertinent to ealier bound variables.
+(assert (equal-mod-gensyms
+         (macroexpand-1
+          '(sb-int:binding* (((v1 v2 nil) (foo))
+                             (a (f v1))
+                             (b (g v2)))
+            (declare (special fred) (optimize speed)
+                     (optimize (debug 3)))
+            (declare (integer v1 v2))
+            (body)))
+         '(multiple-value-bind (v1 v2 #1=#:g538) (foo)
+           (declare (integer v1 v2))
+           (declare (ignorable #1#))
+           (let* ((a (f v1)) (b (g v2)))
+             (declare (special fred) (optimize speed) (optimize (debug 3)))
+             (body)))))
+
+;; :EXIT-IF-NULL was inserting declarations into the WHEN expression.
+(assert (equal-mod-gensyms
+         (macroexpand-1
+          '(sb-int:binding* (((a1 a2) (f))
+                             (b (g))
+                             ((c1 nil c2) (h) :exit-if-null)
+                             ((d1 d1) (f))
+                             (nil (e) :exit-if-null))
+            (declare (special fff c2) (integer d1))
+            (declare (fixnum a2)
+                     (special *x* *y* c1))
+            (declare (cons b) (type integer *y* a1))
+            (a-body-form)
+            (another-body-form)))
+         '(multiple-value-bind (a1 a2) (f)
+           (declare (fixnum a2) (type integer a1))
+           (let* ((b (g)))
+             (declare (cons b))
+             (multiple-value-bind (c1 #2=#:dummy-1 c2) (h)
+               (declare (special c2) (special c1))
+               (declare (ignorable #2#))
+               (when c1
+                 (multiple-value-bind (d1 d1) (f)
+                   (declare (integer d1))
+                   (let* ((#3=#:dummy-2 (e)))
+                     (declare (ignorable #3#))
+                     (declare (special fff))
+                     (declare (special *y* *x*))
+                     (declare (type integer *y*))
+                     (when #3#
+                       (a-body-form) (another-body-form))))))))))
+
+) ; end BINDING*-EXPANDER test
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (import '(sb-int:&more sb-int:parse-lambda-list)))
+
+(with-test (:name :parse-lambda-list)
+  ;; 3.4.1 - ordinary lambda list
+  (assert-error (parse-lambda-list '(foo &body bar)))
+  (assert-error (parse-lambda-list '(foo &whole bar)))
+  (assert-error (parse-lambda-list '(foo &environment bar)))
+  ;; &more expects exactly two following symbols
+  (assert-error (parse-lambda-list '(foo &more)))
+  (assert-error (parse-lambda-list '(foo &more c)))
+  (assert-error (parse-lambda-list '(foo &more ctxt ct junk)))
+  ;; &more and &rest are mutually exclusive
+  (assert-error (parse-lambda-list '(foo &rest foo &more ctxt n)))
+  (assert-error (parse-lambda-list '(foo &more ctxt n &rest foo)))
+
+  ;; 3.4.2 - generic function lambda lists
+  (macroexpand-1 '(defgeneric foo (a b &key size &allow-other-keys)))
+  (assert-error (macroexpand-1 '(defgeneric foo (a b &aux x)))
+                sb-pcl::generic-function-lambda-list-error)
+  ;; 3.4.3 - FIXME: add tests
+
+  ;; 3.4.4 - doesn't use PARSE-LAMBDA-LIST yet
+  ;; 3.4.5 - same
+
+  ;; 3.4.6 - BOA lambda list is a function lambda list,
+  ;; but the expander silently disregarded the internal &MORE keyword,
+  ;; which has no place in DEFSTRUCT.
+  (assert-error
+   (macroexpand-1 '(defstruct (s (:constructor
+                                  make-s (a b &more ctxt n)))
+                    a b ctxt n)))
+
+  ;; 3.4.7 - DEFSETF disallows &AUX
+  (assert-error (macroexpand-1
+                 '(defsetf foof (a b &optional k &aux) (v1 v2) (forms))))
+
+  ;; 3.4.8 - DEFTYPE is exactly like DEFMACRO
+  ;;         except for the implied default-default of '*
+
+  ;; 3.4.9 - DEFINE-MODIFY-MACRO allows only &OPTIONAL and &REST
+  (assert-error (macroexpand-1
+                 '(define-modify-macro foof (a b &optional k &key) foo)))
+  (assert-error (macroexpand-1
+                 '(define-modify-macro foof (a b &optional k &body) foo)))
+
+  ;; 3.4.10 - DEFINE-METHOD-COMBINATION. Not even sure what this does.
+
+  )

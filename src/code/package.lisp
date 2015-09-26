@@ -33,10 +33,10 @@
 ;; FIXME: too vaguely named. Should be PACKAGE-HASH-VECTOR.
 (def!type hash-vector () '(simple-array (unsigned-byte 8) (*)))
 
-(def!struct (package-hashtable
-             (:constructor %make-package-hashtable
-                           (cells size &aux (free size)))
-             (:copier nil))
+(sb!xc:defstruct (package-hashtable
+                  (:constructor %make-package-hashtable
+                                (cells size &aux (free size)))
+                  (:copier nil))
   ;; The general-vector of symbols, with a hash-vector in its last cell.
   (cells (missing-arg) :type simple-vector)
   ;; The total number of entries allowed before resizing.
@@ -52,27 +52,10 @@
 
 ;;;; the PACKAGE structure
 
-;;; Meta: IN-PACKAGE references a string constant, not a package.
-;;; But we need this to be a DEF!STRUCT to emit 'package.h'
-;;; during first genesis.
-;;; KLUDGE: We use DEF!STRUCT to define this not because we need to
-;;; manipulate target package objects on the cross-compilation host,
-;;; but only because its MAKE-LOAD-FORM function needs to be hooked
-;;; into the pre-CLOS DEF!STRUCT MAKE-LOAD-FORM system so that we can
-;;; compile things like IN-PACKAGE in warm init before CLOS is set up.
-;;; The DEF!STRUCT side effect of defining a new PACKAGE type on the
-;;; cross-compilation host is just a nuisance, and in order to avoid
-;;; breaking the cross-compilation host, we need to work around it
-;;; around by putting the new PACKAGE type (and the PACKAGEP predicate
-;;; too..) into SB!XC. -- WHN 20000309
-(def!struct (sb!xc:package
-             (:constructor %make-package
-                 (%name internal-symbols external-symbols))
-             (:make-load-form-fun (lambda (p)
-                                    (values `(find-undeleted-package-or-lose
-                                              ',(package-name p))
-                                            nil)))
-             (:predicate sb!xc:packagep))
+(sb!xc:defstruct (package
+                  (:constructor %make-package
+                                (%name internal-symbols external-symbols))
+                  (:predicate packagep))
   #!+sb-doc
   "the standard structure for the description of a package"
   ;; the name of the package, or NIL for a deleted package
@@ -85,7 +68,7 @@
   ;; Derived from %USE-LIST, but maintained separately.
   (tables #() :type simple-vector)
   ;; index into TABLES of the table in which an inherited symbol was most
-  ;; recently found. On the next FIND-SYMBOL* operation, the indexed table
+  ;; recently found. On the next %FIND-SYMBOL operation, the indexed table
   ;; is tested first.
   (mru-table-index 0 :type index)
   ;; packages that use this package
@@ -108,6 +91,11 @@
   ;; Local package nicknames.
   (%local-nicknames nil :type list)
   (%locally-nicknamed-by nil :type list))
+
+#-sb-xc-host
+(defmethod make-load-form ((p package) &optional environment)
+  (declare (ignore environment))
+  `(find-undeleted-package-or-lose ,(package-name p)))
 
 ;;;; iteration macros
 
@@ -162,91 +150,6 @@
 
 
 ;;;; WITH-PACKAGE-ITERATOR
-
-(defun package-iter-init (access-types pkg-designator-list)
-  (declare (type (integer 1 7) access-types)) ; a nonzero bitmask over types
-  (values (logior (ash access-types 3) #b11) 0 #()
-          (package-listify pkg-designator-list)))
-
-(declaim (inline pkg-symbol-valid-p))
-(defun pkg-symbol-valid-p (x) (not (fixnump x)))
-
-;; The STATE parameter is comprised of 4 packed fields
-;;  [0:1] = substate {0=internal,1=external,2=inherited,3=initial}
-;;  [2]   = package with inherited symbols has shadowing symbols
-;;  [3:5] = enabling bits for {internal,external,inherited}
-;;  [6:]  = index into 'package-tables'
-;;
-(defconstant +package-iter-check-shadows+  #b000100)
-
-(defun package-iter-step (start-state index sym-vec pkglist)
-  ;; the defknown isn't enough
-  (declare (type fixnum start-state) (type index index)
-           (type simple-vector sym-vec) (type list pkglist))
-  (declare (optimize speed))
-  (labels
-      ((advance (state) ; STATE is the one just completed
-         (case (logand state #b11)
-           ;; Test :INHERITED first because the state repeats for a package
-           ;; as many times as there are packages it uses. There are enough
-           ;; bits to count up to 2^23 packages if fixnums are 30 bits.
-           (2
-            (when (desired-state-p 2)
-              (let* ((tables (package-tables (this-package)))
-                     (next-state (the fixnum (+ state (ash 1 6))))
-                     (table-idx (ash next-state -6)))
-              (when (< table-idx (length tables))
-                (return-from advance ; remain in state 2
-                  (start next-state (svref tables table-idx))))))
-            (pop pkglist)
-            (advance 3)) ; start on next package
-           (1 ; finished externals, switch to inherited if desired
-            (when (desired-state-p 2)
-              (let ((tables (package-tables (this-package))))
-                (when (plusp (length tables)) ; inherited symbols
-                  (return-from advance ; enter state 2
-                    (start (if (package-%shadowing-symbols (this-package))
-                               (logior 2 +package-iter-check-shadows+) 2)
-                           (svref tables 0))))))
-            (advance 2)) ; skip state 2
-           (0 ; finished internals, switch to externals if desired
-            (if (desired-state-p 1) ; enter state 1
-                (start 1 (package-external-symbols (this-package)))
-                (advance 1))) ; skip state 1
-           (t ; initial state
-            (cond ((endp pkglist) ; latch into returning NIL forever more
-                   (values 0 0 #() '() nil nil))
-                  ((desired-state-p 0) ; enter state 0
-                   (start 0 (package-internal-symbols (this-package))))
-                  (t (advance 0)))))) ; skip state 0
-       (desired-state-p (target-state)
-         (logtest start-state (ash 1 (+ target-state 3))))
-       (this-package ()
-         (truly-the sb!xc:package (car pkglist)))
-       (start (next-state new-table)
-         (let ((symbols (package-hashtable-cells new-table)))
-           (package-iter-step (logior (mask-field (byte 3 3) start-state)
-                                      next-state)
-                              ;; assert that physical length was nonzero
-                              (the index (1- (length symbols)))
-                              symbols pkglist))))
-    (declare (inline desired-state-p this-package))
-    (if (zerop index)
-        (advance start-state)
-        (macrolet ((scan (&optional (guard t))
-                   `(loop
-                     (let ((sym (aref sym-vec (decf index))))
-                       (when (and (pkg-symbol-valid-p sym) ,guard)
-                         (return (values start-state index sym-vec pkglist sym
-                                         (aref #(:internal :external :inherited)
-                                               (logand start-state 3))))))
-                     (when (zerop index)
-                       (return (advance start-state))))))
-          (declare #-sb-xc-host(optimize (sb!c::insert-array-bounds-checks 0)))
-          (if (logtest start-state +package-iter-check-shadows+)
-              (let ((shadows (package-%shadowing-symbols (this-package))))
-                (scan (not (member sym shadows :test #'string=))))
-              (scan))))))
 
 (defmacro-mundanely with-package-iterator ((mname package-list
                                                   &rest symbol-types)

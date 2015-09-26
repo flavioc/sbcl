@@ -145,11 +145,11 @@
   (def-type-predicate-wrapper %other-pointer-p)
   (def-type-predicate-wrapper system-area-pointer-p)
   (def-type-predicate-wrapper weak-pointer-p)
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+  #!-64-bit
   (progn
     (def-type-predicate-wrapper unsigned-byte-32-p)
     (def-type-predicate-wrapper signed-byte-32-p))
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+  #!+64-bit
   (progn
     (def-type-predicate-wrapper unsigned-byte-64-p)
     (def-type-predicate-wrapper signed-byte-64-p))
@@ -189,6 +189,8 @@
 (defun type-of (object)
   #!+sb-doc
   "Return the type of OBJECT."
+  ;; We have special logic for everything except arrays.
+  ;; Arrays use CTYPE-OF and then convert the answer to a specifier.
   (typecase object
     (fixnum
      (cond

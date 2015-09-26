@@ -1,5 +1,5 @@
 (defpackage :sb-mpfr
-  (:use "COMMON-LISP" "SB-ALIEN" "SB-C-CALL")
+  (:use "COMMON-LISP" "SB-ALIEN")
   (:import-from "SB-GMP"
                 #:make-gmp-rstate
                 #:make-gmp-rstate-lc
@@ -191,7 +191,7 @@
 (defun try-load-shared-object (pathname)
   (handler-case
       (load-shared-object pathname :dont-save t)
-    (error (e)
+    (error ()
       nil)))
 
 (defun %load-mpfr ()

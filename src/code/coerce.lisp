@@ -11,33 +11,27 @@
 
 (in-package "SB!IMPL")
 
-(macrolet ((def (name result access src-type &optional typep)
-             `(defun ,name (object ,@(if typep '(type) ()))
-                (declare (type ,(ecase src-type
-                                       (:list 'list)
-                                       (:vector 'vector)
-                                       (:sequence 'sequence)) object))
+(macrolet ((def (name constructor access src-type)
+             `(defun ,name (object type)
+                (declare (type ,src-type object))
                 (do* ((index 0 (1+ index))
                       (length (length object))
-                      (result ,result)
+                      (result ,constructor)
                       (in-object object))
                      ((>= index length) result)
                   (declare (fixnum length index))
                   (declare (type vector result))
                   (setf (,access result index)
                         ,(ecase src-type
-                           (:list '(pop in-object))
-                           (:vector '(aref in-object index))
-                           (:sequence '(elt in-object index))))))))
+                           (list '(pop in-object))
+                           (vector '(aref in-object index))
+                           (sequence '(elt in-object index))))))))
 
-  (def list-to-vector* (make-sequence type length)
-    aref :list t)
+  (def list-to-vector* (make-sequence type length) aref list)
 
-  (def vector-to-vector* (make-sequence type length)
-    aref :vector t)
+  (def vector-to-vector* (make-sequence type length) aref vector)
 
-  (def sequence-to-vector* (make-sequence type length)
-    aref :sequence t))
+  (def sequence-to-vector* (make-sequence type length) aref sequence))
 
 (defun vector-to-list* (object)
   (declare (type vector object))
@@ -126,7 +120,6 @@
   #!+sb-doc
   "Coerce the Object to an object of type Output-Type-Spec."
   (flet ((coerce-error ()
-           (/show0 "entering COERCE-ERROR")
            (error 'simple-type-error
                   :format-control "~S can't be converted to type ~S."
                   :format-arguments (list object output-type-spec)
@@ -134,7 +127,7 @@
                   :expected-type output-type-spec)))
     (let ((type (specifier-type output-type-spec)))
       (cond
-        ((%typep object output-type-spec)
+        ((%%typep object type)
          object)
         ((eq type *empty-type*)
          (coerce-error))
@@ -281,7 +274,7 @@
            result))
     (let ((type (specifier-type output-type-spec)))
       (cond
-        ((%typep object output-type-spec)
+        ((%%typep object type)
          object)
         ((eq type *empty-type*)
          (coerce-error))

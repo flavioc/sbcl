@@ -115,6 +115,7 @@
 
 (defmacro with-error-info ((string &rest args) &body forms)
   `(handler-bind ((error (lambda (e)
+                           (declare (ignorable e))
                            (format t ,string ,@args)
                            (finish-output))))
      (progn ,@forms)))
@@ -201,6 +202,7 @@
     (defmacro test:unused () ''foo)
     (setf (macro-function 'test:unused) (constantly 'foo))
     (define-compiler-macro test:unused (&whole form arg)
+      (declare (ignore arg))
       form)
     (setf (compiler-macro-function 'test:unused) (constantly 'foo))
 
@@ -241,6 +243,7 @@
     (define-setf-expander test:car (place)
       (multiple-value-bind (dummies vals newval setter getter)
           (get-setf-expansion place)
+        (declare (ignore newval setter))
         (let ((store (gensym)))
           (values dummies
                   vals
@@ -391,22 +394,24 @@
 ;;; test restarts.
 (reset-test t)
 
-(dolist (form *illegal-runtime-forms*)
-  (with-error-info ("one error per form ~S~%" form)
-    (let ((errorp nil))
-      (handler-bind ((package-lock-violation (lambda (e)
-                                               (when errorp
-                                                 (error "multiple errors"))
-                                               (setf errorp t)
-                                               (continue e))))
-        (eval form)))))
+(with-test (:name :illegal-runtime-forms)
+ (dolist (form *illegal-runtime-forms*)
+   (with-error-info ("one error per form ~S~%" form)
+     (let ((errorp nil))
+       (handler-bind ((package-lock-violation (lambda (e)
+                                                (when errorp
+                                                  (error "multiple errors ~%~a~% and ~%~a"
+                                                         errorp e))
+                                                (setf errorp e)
+                                                (continue e))))
+         (eval form))))))
 
 (dolist (form *illegal-double-forms*)
   (with-error-info ("two errors per form: ~S~%" form)
     (let ((error-count 0))
       ;; check that we don't get multiple errors from a single form
       (handler-bind ((package-lock-violation (lambda (x)
-                                               (declare (ignore x))
+                                               (declare (ignorable x))
                                                (incf error-count)
                                                (continue x))))
         (eval form)
@@ -418,8 +423,7 @@
 ;;;
 ;;; This is not part of the interface, but it is the behaviour we want
 (let* ((tmp "package-locks.tmp.lisp")
-       (fasl (compile-file-pathname tmp))
-       (n 0))
+       (fasl (compile-file-pathname tmp)))
   (dolist (form *illegal-runtime-forms*)
     (unwind-protect
          (with-simple-restart (next "~S failed, continue with next test" form)
@@ -427,6 +431,7 @@
            (with-open-file (f tmp :direction :output)
              (prin1 form f))
            (multiple-value-bind (file warnings failure-p) (compile-file tmp)
+             (declare (ignore file warnings failure-p))
              (set-test-locks t)
              (assert-error (load fasl)
                            sb-ext:package-lock-violation)))
@@ -578,4 +583,28 @@
     :foo :bar)
    symbol-package-locked-error))
 
-;;; WOOT! Done.
+(with-test (:name :defcostant-locks)
+  (assert-error (defconstant test:constant 100)
+                symbol-package-locked-error))
+
+(with-test (:name :defstruct-compile-time-locks)
+  (assert-error (ctu:file-compile
+                 `((defstruct test:nostruct)))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.1
+                               (:conc-name))
+                     test:nostruct)))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.2
+                               (:predicate test:nostruct)))))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.3
+                               (:copier test:nostruct)))))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.4
+                               (:constructor test:nostruct)))))
+      symbol-package-locked-error))

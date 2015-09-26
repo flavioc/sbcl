@@ -219,13 +219,14 @@
 
 ;;; feature: we shall complain if functions which are only useful for
 ;;; their result are called and their result ignored.
-(loop for (form expected-des) in
+(with-test (:name :discarded-result)
+  (loop for (form expected-des) in
         '(((progn (nreverse (list 1 2)) t)
            "The return value of NREVERSE should not be discarded.")
           ((progn (nreconc (list 1 2) (list 3 4)) t)
            "The return value of NRECONC should not be discarded.")
           ((locally
-             (declare (inline sort))
+               (declare (inline sort))
              (sort (list 1 2) #'<) t)
            ;; FIXME: it would be nice if this warned on non-inlined sort
            ;; but the current simple boolean function attribute
@@ -257,30 +258,28 @@
            "The return value of NSET-DIFFERENCE should not be discarded.")
           ((progn (nset-exclusive-or (list 1 3) (list 2 4)) t)
            "The return value of NSET-EXCLUSIVE-OR should not be discarded."))
-      for expected = (if (listp expected-des)
-                       expected-des
-                       (list expected-des))
-      do
-  (multiple-value-bind (fun warnings-p failure-p)
-      (handler-bind ((style-warning (lambda (c)
-                      (if expected
-                        (let ((expect-one (pop expected)))
-                          (assert (search expect-one
-                                          (with-standard-io-syntax
-                                            (let ((*print-right-margin* nil))
-                                              (princ-to-string c))))
-                                  ()
-                                  "~S should have warned ~S, but instead warned: ~A"
-                                  form expect-one c))
-                        (error "~S shouldn't give a(nother) warning, but did: ~A" form c)))))
-        (compile nil `(lambda () ,form)))
-  (declare (ignore warnings-p))
-  (assert (functionp fun))
-  (assert (null expected)
-          ()
-          "~S should have warned ~S, but didn't."
-          form expected)
-  (assert (not failure-p))))
+        for expected = (sb-int:ensure-list expected-des)
+        do
+        (multiple-value-bind (fun warnings-p failure-p)
+            (handler-bind ((style-warning (lambda (c)
+                                            (if expected
+                                                (let ((expect-one (pop expected)))
+                                                  (assert (search expect-one
+                                                                  (with-standard-io-syntax
+                                                                    (let ((*print-right-margin* nil))
+                                                                      (princ-to-string c))))
+                                                          ()
+                                                          "~S should have warned ~S, but instead warned: ~A"
+                                                          form expect-one c))
+                                                (error "~S shouldn't give a(nother) warning, but did: ~A" form c)))))
+              (compile nil `(lambda () ,form)))
+          (declare (ignore warnings-p))
+          (assert (functionp fun))
+          (assert (null expected)
+                  ()
+                  "~S should have warned ~S, but didn't."
+                  form expected)
+          (assert (not failure-p)))))
 
 ;;; a bug in the MAP deftransform caused non-VECTOR array specifiers
 ;;; to cause errors in the compiler.  Fixed by CSR in 0.7.8.10
@@ -464,6 +463,9 @@
               (x &key (y nil x))
               (&key (y nil z) (z nil w))
               (&whole x &optional x)
+              ;; Uh, this test is semi-bogus - it's trying to test that
+              ;; you can't repeat, but it's now actually testing that
+              ;; &WHOLE has to appear first, per the formal spec.
               (&environment x &whole x)))
   (assert (nth-value 2
                      (handler-case
@@ -473,7 +475,8 @@
                                                 (bar (&environment env)
                                                   `',(macro-function 'foo env)))
                                        (bar))))
-                       (error (c)
+                       ((or warning error) (c)
+                         (declare (ignore c))
                          (values nil t t))))))
 
 (assert (typep (eval `(the arithmetic-error
@@ -2734,6 +2737,8 @@
   (assert (equal "#<FUNCTION READ-LINE>" (princ-to-string #'read-line))))
 
 ;;; PROGV + RESTRICT-COMPILER-POLICY
+;; META: there's a test in compiler.impure.lisp that also tests
+;; interaction of PROGV with (debug 3). These tests should be together.
 (with-test (:name :progv-and-restrict-compiler-policy)
   (let ((sb-c::*policy-restrictions* sb-c::*policy-restrictions*))
     (restrict-compiler-policy 'debug 3)
@@ -3112,18 +3117,9 @@
           (array-in-bounds-p s 9)))
       (must-not-optimize
        ;; don't trust non-simple array length in safety=1
-       (let ((a (the (array * (10)) (make-array 10 :adjustable t))))
-         (eval `(adjust-array ,a 0))
-         (array-in-bounds-p a 9))
-       ;; same for a union type
-       (let ((s (the (string 10) (make-array 10
-                                             :element-type 'character
-                                             :adjustable t))))
-         (eval `(adjust-array ,s 0))
-         (array-in-bounds-p s 9))
-       ;; single unknown dimension
-       (let ((a (make-array (random 20))))
-         (array-in-bounds-p a 10))
+       (let ((a (the (array * (10 20)) (make-array '(10 20) :adjustable t))))
+         (eval `(adjust-array ,a '(0 0)))
+         (array-in-bounds-p a 9 0))
        ;; multiple unknown dimensions
        (let ((a (make-array (list (random 20) (random 5)))))
          (array-in-bounds-p a 5 2))
@@ -3131,17 +3127,17 @@
        (let ((a (make-array (list 1 (random 5)))))
          (array-in-bounds-p a 0 2))
        ;; subscript might be negative
-       (let ((a (make-array 5)))
-         (array-in-bounds-p a (- (random 3) 2)))
+       (let ((a (make-array '(5 10))))
+         (array-in-bounds-p a 1 (- (random 3) 2)))
        ;; subscript might be too large
-       (let ((a (make-array 5)))
-         (array-in-bounds-p a (random 6)))
+       (let ((a (make-array '(5 10))))
+         (array-in-bounds-p a (random 6) 1))
        ;; unknown upper bound
-       (let ((a (make-array 5)))
-         (array-in-bounds-p a (get-universal-time)))
+       (let ((a (make-array '(5 10))))
+         (array-in-bounds-p a (get-universal-time) 1))
        ;; unknown lower bound
-       (let ((a (make-array 5)))
-         (array-in-bounds-p a (- (get-universal-time))))
+       (let ((a (make-array '(5 30))))
+         (array-in-bounds-p a 0 (- (get-universal-time))))
        ;; in theory we should be able to optimize
        ;; the following but the current implementation
        ;; doesn't cut it because the array type's
@@ -4917,7 +4913,8 @@
               (list (string 'list))
               (list "lisT")))))
 
-(with-test (:name (restart-case optimize speed compiler-note))
+(with-test (:name (restart-case optimize speed compiler-note)
+                 :skipped-on :sparc) ; crashes the test driver
   (handler-bind ((compiler-note #'error))
     (compile nil '(lambda ()
                    (declare (optimize speed))
@@ -5513,3 +5510,89 @@
       (let ((err-string (with-output-to-string (*error-output*)
                           (compile-file input :print nil))))
         (assert (search expect err-string))))))
+
+(with-test (:name :coerce-derive-type)
+  (macrolet ((check (type ll form &rest values)
+               `(assert (equal (funcall (compile nil `(lambda ,',ll
+                                                        (ctu:compiler-derived-type ,',form)))
+                                        ,@values)
+                               ',type))))
+    (check list
+           (a)
+           (coerce a 'list)
+           nil)
+    (check (unsigned-byte 32)
+           (a)
+           (coerce a '(unsigned-byte 32))
+           10)
+    (check character
+           (a x)
+           (coerce a (array-element-type (the (array character) x)))
+           #\a
+           "abc")
+    (check (unsigned-byte 32)
+           (a x)
+           (coerce a (array-element-type (the (array (unsigned-byte 32)) x)))
+           10
+           (make-array 10 :element-type '(unsigned-byte 32)))))
+
+(with-test (:name :associate-args)
+  (assert-error
+   (funcall (compile nil `(lambda (x) (+ 1 x nil)))
+            2))
+  (assert-error
+   (funcall (compile nil `(lambda (x) (/ 1 x nil))) 4)))
+
+(with-test (:name :eager-substitute-single-use-lvar)
+  (assert (= (funcall
+              (compile nil
+                       `(lambda (a)
+                          (declare (optimize (debug 0) (safety 0)))
+                          (let ((a (the fixnum a))
+                                (x 1)
+                                z)
+                            (tagbody
+                               (flet ((jump () (go loop)))
+                                 (jump))
+                             loop
+                               (setf z (the fixnum (if (= x 1) #xFFF a)))
+                               (unless (= x 0)
+                                 (setf x 0)
+                                 (go loop)))
+                            z)))
+              2))))
+
+(with-test (:name :vop-on-eql-type)
+  (assert (= (funcall
+              (funcall (compile nil
+                                `(lambda (b)
+                                   (declare ((eql -7) b)
+                                            (optimize debug))
+                                   (lambda (x)
+                                     (logior x b))))
+                       -7)
+              3)
+             -5)))
+
+(with-test (:name :malformed-macrolet)
+  (flet ((test (form)
+           (multiple-value-bind (fun warn fail)
+               (compile nil `(lambda () ,form))
+             (assert (and warn fail))
+             (assert-error (funcall fun) sb-int:compiled-program-error))))
+    (test '(macrolet (foo () 'bar)))
+    (test '(macrolet x))
+    (test '(symbol-macrolet x))
+    (test '(symbol-macrolet (x)))))
+
+
+(with-test (:name :malformed-flet)
+  (flet ((test (form)
+           (multiple-value-bind (fun warn fail)
+               (compile nil `(lambda () ,form))
+             (assert (and warn fail))
+             (assert-error (funcall fun) sb-int:compiled-program-error))))
+    (test '(flet (foo () 'bar)))
+    (test '(flet x))
+    (test '(labels (foo () 'bar)))
+    (test '(labels x))))

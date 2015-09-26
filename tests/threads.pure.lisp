@@ -11,26 +11,21 @@
 ;;;; absoluely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
+(cl:defpackage #:thread-test
+  (:use #:cl #:sb-thread #:sb-ext #:test-util #:assertoid))
 
-(defpackage :thread-test
-  (:use :cl :sb-thread :sb-ext))
-
-(in-package :thread-test)
-
-(use-package :test-util)
+(cl:in-package #:thread-test)
 
 (with-test (:name atomic-update
             :skipped-on '(not :sb-thread))
   (let ((x (cons :count 0))
         (nthreads (ecase sb-vm:n-word-bits (32 100) (64 1000))))
-    (mapc #'sb-thread:join-thread
+    (mapc #'join-thread
           (loop repeat nthreads
-                collect (sb-thread:make-thread
-                         (lambda ()
-                           (loop repeat 1000
-                                 do (atomic-update (cdr x) #'1+)
-                                    (sleep 0.00001))))))
+             collect (make-thread (lambda ()
+                                    (loop repeat 1000
+                                       do (atomic-update (cdr x) #'1+)
+                                         (sleep 0.00001))))))
     (assert (equal x `(:count ,@(* 1000 nthreads))))))
 
 (with-test (:name mutex-owner)
@@ -102,7 +97,7 @@
                                                          do (find-class (gensym) nil))
                                                  (serious-condition ()
                                                    (setf oops t))))))))
-    (mapcar #'sb-thread:join-thread threads)
+    (mapc #'join-thread threads)
     (assert (not oops))))
 
 (with-test (:name :semaphore-multiple-waiters :skipped-on '(not :sb-thread))
@@ -111,11 +106,11 @@
                (values
                 (loop for r from 0 below n
                       collect
-                      (sb-thread:make-thread
+                      (make-thread
                        (lambda ()
                          (let ((sem semaphore))
                            (dotimes (s i)
-                             (sb-thread:wait-on-semaphore sem))))
+                             (wait-on-semaphore sem))))
                        :name "reader"))
                 (* n i)))
              (make-writers (n readers i)
@@ -125,11 +120,11 @@
                     (let ((writers
                            (loop for w from 0 below n
                                  collect
-                                 (sb-thread:make-thread
+                                 (make-thread
                                   (lambda ()
                                     (let ((sem semaphore))
                                       (dotimes (s k)
-                                        (sb-thread:signal-semaphore sem))))
+                                        (signal-semaphore sem))))
                                   :name "writer"))))
                       (assert (zerop rem))
                       writers)
@@ -140,9 +135,9 @@
                  (multiple-value-bind (writers y) (make-writers w r n)
                    (assert (= (length writers) w))
                    (assert (= x y))
-                   (mapc #'sb-thread:join-thread writers)
-                   (mapc #'sb-thread:join-thread readers)
-                   (assert (zerop (sb-thread:semaphore-count semaphore)))
+                   (mapc #'join-thread writers)
+                   (mapc #'join-thread readers)
+                   (assert (zerop (semaphore-count semaphore)))
                    (values)))))
       (assert
        (eq :ok
@@ -162,10 +157,10 @@
 
 (with-test (:name :waitqueue-circle-print :skipped-on '(not :sb-thread))
   (let* ((*print-circle* nil)
-         (lock (sb-thread:make-mutex))
-         (wq (sb-thread:make-waitqueue)))
-    (sb-thread:with-recursive-lock (lock)
-      (sb-thread:condition-notify wq))
+         (lock (make-mutex))
+         (wq (make-waitqueue)))
+    (with-recursive-lock (lock)
+      (condition-notify wq))
     ;; Used to blow stack due to recursive structure.
     (assert (princ-to-string wq))))
 
@@ -285,7 +280,7 @@
                        (sb-thread::symbol-value-in-thread-error-info e)))))
     (assert error-occurred)))
 
-(with-test (:name :symbol-value-in-thread.8  :skipped-on '(not :sb-thread))
+(with-test (:name :symbol-value-in-thread.8 :skipped-on '(not :sb-thread))
   (let ((child (make-thread (lambda ())))
         (error-occurred nil))
     (join-thread child)
@@ -299,48 +294,50 @@
                        (sb-thread::symbol-value-in-thread-error-info e)))))
     (assert error-occurred)))
 
-(with-test (:name :deadlock-detection.1  :skipped-on '(not :sb-thread))
+(with-test (:name :deadlock-detection.1 :skipped-on '(not :sb-thread))
   (loop
     repeat 1000
     do (flet ((test (ma mb sa sb)
                 (lambda ()
                   (handler-case
-                      (sb-thread:with-mutex (ma)
-                        (sb-thread:signal-semaphore sa)
-                        (sb-thread:wait-on-semaphore sb)
-                        (sb-thread:with-mutex (mb)
+                      (with-mutex (ma)
+                        (signal-semaphore sa)
+                        (wait-on-semaphore sb)
+                        (with-mutex (mb)
                           :ok))
-                    (sb-thread:thread-deadlock (e)
-                      (princ e)
+                    (thread-deadlock (e)
+                      ;; (assert (plusp (length ...))) prevents
+                      ;; flushing.
+                      (assert (plusp (length (princ-to-string e))))
                       :deadlock)))))
-         (let* ((m1 (sb-thread:make-mutex :name "M1"))
-                (m2 (sb-thread:make-mutex :name "M2"))
-                (s1 (sb-thread:make-semaphore :name "S1"))
-                (s2 (sb-thread:make-semaphore :name "S2"))
-                (t1 (sb-thread:make-thread (test m1 m2 s1 s2) :name "T1"))
-                (t2 (sb-thread:make-thread (test m2 m1 s2 s1) :name "T2")))
+         (let* ((m1 (make-mutex :name "M1"))
+                (m2 (make-mutex :name "M2"))
+                (s1 (make-semaphore :name "S1"))
+                (s2 (make-semaphore :name "S2"))
+                (t1 (make-thread (test m1 m2 s1 s2) :name "T1"))
+                (t2 (make-thread (test m2 m1 s2 s1) :name "T2")))
            ;; One will deadlock, and the other will then complete normally.
-           (let ((res (list (sb-thread:join-thread t1)
-                            (sb-thread:join-thread t2))))
+           (let ((res (list (join-thread t1)
+                            (join-thread t2))))
              (assert (or (equal '(:deadlock :ok) res)
                          (equal '(:ok :deadlock) res))))))))
 
 (with-test (:name :deadlock-detection.2 :skipped-on '(not :sb-thread))
-  (let* ((m1 (sb-thread:make-mutex :name "M1"))
-         (m2 (sb-thread:make-mutex :name "M2"))
-         (s1 (sb-thread:make-semaphore :name "S1"))
-         (s2 (sb-thread:make-semaphore :name "S2"))
-         (t1 (sb-thread:make-thread
+  (let* ((m1 (make-mutex :name "M1"))
+         (m2 (make-mutex :name "M2"))
+         (s1 (make-semaphore :name "S1"))
+         (s2 (make-semaphore :name "S2"))
+         (t1 (make-thread
               (lambda ()
-                (sb-thread:with-mutex (m1)
-                  (sb-thread:signal-semaphore s1)
-                  (sb-thread:wait-on-semaphore s2)
-                  (sb-thread:with-mutex (m2)
+                (with-mutex (m1)
+                  (signal-semaphore s1)
+                  (wait-on-semaphore s2)
+                  (with-mutex (m2)
                     :ok)))
               :name "T1")))
     (prog (err)
      :retry
-       (handler-bind ((sb-thread:thread-deadlock
+       (handler-bind ((thread-deadlock
                        (lambda (e)
                          (unless err
                            ;; Make sure we can print the condition
@@ -350,43 +347,43 @@
                            (go :retry)))))
          (when err
            (sleep 1))
-         (assert (eq :ok (sb-thread:with-mutex (m2)
+         (assert (eq :ok (with-mutex (m2)
                            (unless err
-                             (sb-thread:signal-semaphore s2)
-                             (sb-thread:wait-on-semaphore s1)
+                             (signal-semaphore s2)
+                             (wait-on-semaphore s1)
                              (sleep 1))
-                           (sb-thread:with-mutex (m1)
+                           (with-mutex (m1)
                              :ok)))))
        (assert (stringp err)))
-    (assert (eq :ok (sb-thread:join-thread t1)))))
+    (assert (eq :ok (join-thread t1)))))
 
 (with-test (:name :deadlock-detection.3  :skipped-on '(not :sb-thread))
-  (let* ((m1 (sb-thread:make-mutex :name "M1"))
-         (m2 (sb-thread:make-mutex :name "M2"))
-         (s1 (sb-thread:make-semaphore :name "S1"))
-         (s2 (sb-thread:make-semaphore :name "S2"))
-         (t1 (sb-thread:make-thread
+  (let* ((m1 (make-mutex :name "M1"))
+         (m2 (make-mutex :name "M2"))
+         (s1 (make-semaphore :name "S1"))
+         (s2 (make-semaphore :name "S2"))
+         (t1 (make-thread
               (lambda ()
-                (sb-thread:with-mutex (m1)
-                  (sb-thread:signal-semaphore s1)
-                  (sb-thread:wait-on-semaphore s2)
-                  (sb-thread:with-mutex (m2)
+                (with-mutex (m1)
+                  (signal-semaphore s1)
+                  (wait-on-semaphore s2)
+                  (with-mutex (m2)
                     :ok)))
               :name "T1")))
     ;; Currently we don't consider it a deadlock
     ;; if there is a timeout in the chain.
     (assert (eq :deadline
                 (handler-case
-                    (sb-thread:with-mutex (m2)
-                      (sb-thread:signal-semaphore s2)
-                      (sb-thread:wait-on-semaphore s1)
+                    (with-mutex (m2)
+                      (signal-semaphore s2)
+                      (wait-on-semaphore s1)
                       (sleep 1)
                       (sb-sys:with-deadline (:seconds 0.1)
-                        (sb-thread:with-mutex (m1)
+                        (with-mutex (m1)
                           :ok)))
                   (sb-sys:deadline-timeout ()
                     :deadline)
-                  (sb-thread:thread-deadlock ()
+                  (thread-deadlock ()
                     :deadlock))))
     (assert (eq :ok (join-thread t1)))))
 
@@ -467,46 +464,55 @@
       (unless (eql 50 ok)
         (error "Wanted 50, got ~S" ok)))))
 
-(with-test (:name (:wait-on-semaphore :timeout :one-thread))
-  (let ((sem (make-semaphore))
-        (n 0))
-    (signal-semaphore sem 10)
-    (loop repeat 100
-          do (when (wait-on-semaphore sem :timeout 0.001)
-               (incf n)))
-    (assert (= n 10))))
+(with-test (:name (wait-on-semaphore :timeout :one-thread))
+  (let ((count 10)
+        (semaphore (make-semaphore)))
+    (signal-semaphore semaphore count)
+    (let ((values (loop repeat 100
+                     collect (wait-on-semaphore semaphore :timeout 0.001)))
+          (expected (loop for i from 9 downto 0 collect i)))
+      (assert (equal (remove nil values) expected)))))
 
-(with-test (:name (:wait-on-semaphore :timeout :many-threads)
+(with-test (:name (wait-on-semaphore :timeout :many-threads)
             :skipped-on '(not :sb-thread))
-  (let* ((sem (make-semaphore))
-         (threads
-           (progn
-             (signal-semaphore sem 10)
-             (loop repeat 100
-                   collect (make-thread
-                            (lambda ()
-                              (sleep (random 0.02))
-                              (wait-on-semaphore sem :timeout 0.5)))))))
-    (loop repeat 5
-          do (signal-semaphore sem 2))
-    (let ((ok (count-if #'join-thread threads)))
-      (unless (eql 20 ok)
-        (error "Wanted 20, got ~S" ok)))))
+  (let* ((count 10)
+         (semaphore (make-semaphore)))
+    ;; Add 10 tokens right away.
+    (signal-semaphore semaphore count)
+    ;; 100 threads try to decrement the semaphore by 1.
+    (let ((threads
+           (loop repeat 100
+              collect (make-thread
+                       (lambda ()
+                         (sleep (random 0.02))
+                         (wait-on-semaphore semaphore :timeout 0.5))))))
+      ;; Add 10 more tokens while threads may already be waiting and
+      ;; decrementing.
+      (loop repeat (floor count 2) do (signal-semaphore semaphore 2))
+      ;; 20 threads should have been able to decrement the semaphore
+      ;; and obtain an updated count.
+      (let ((values (mapcar #'join-thread threads)))
+        ;; 20 threads should succeed waiting for the semaphore.
+        (assert (= (* 2 count) (count-if-not #'null values)))
+        ;; The updated semaphore count should be in [0,19] at all
+        ;; times.
+        (assert (every (lambda (value) (<= 0 value (1- (* 2 count))))
+                       (remove nil values)))
+        ;; (At least) one thread should decrease the count to 0.
+        (assert (find 0 values))))))
 
 (with-test (:name (:join-thread :timeout)
-            :skipped-on '(not :sb-thread))
-  (assert (eq :error
-              (handler-case
-                  (join-thread (make-join-thread (lambda () (sleep 10))) :timeout 0.01)
-                (join-thread-error ()
-                  :error))))
+                  :skipped-on '(not :sb-thread))
+  (assert-error
+   (join-thread (make-join-thread (lambda () (sleep 10))) :timeout 0.01)
+   join-thread-error)
   (let ((cookie (cons t t)))
     (assert (eq cookie
                 (join-thread (make-join-thread (lambda () (sleep 10)))
                              :timeout 0.01
                              :default cookie)))))
 
-(with-test (:name (:semaphore-notification :wait-on-semaphore :lp-1038034)
+(with-test (:name (wait-on-semaphore semaphore-notification :lp-1038034)
             :skipped-on '(not :sb-thread)
             :fails-on :sb-thread)
   ;; Test robustness of semaphore acquisition and notification with
@@ -554,7 +560,7 @@
     (write-char #\.)
     (force-output)))
 
-(with-test (:name (:semaphore-notification :wait-on-semaphore)
+(with-test (:name (wait-on-semaphore semaphore-notification)
             :skipped-on '(not :sb-thread))
   (let ((sem (make-semaphore))
         (ok nil)
@@ -601,47 +607,44 @@
           (assert (= n (+ k (length safe))))
           (assert unsafe))))))
 
-(with-test (:name (:semaphore-notification :try-sempahore)
+(with-test (:name (wait-on-semaphore :n))
+  (let ((semaphore (make-semaphore :count 3)))
+    (assert (= 1 (wait-on-semaphore semaphore :n 2)))
+    (assert (= 1 (semaphore-count semaphore)))))
+
+(with-test (:name (try-semaphore semaphore-notification)
             :skipped-on '(not :sb-thread))
   (let* ((sem (make-semaphore))
          (note (make-semaphore-notification)))
-    (try-semaphore sem 1 note)
+    (assert (eql nil (try-semaphore sem 1 note)))
     (assert (not (semaphore-notification-status note)))
     (signal-semaphore sem)
-    (try-semaphore sem 1 note)
+    (assert (eql 0 (try-semaphore sem 1 note)))
     (assert (semaphore-notification-status note))))
 
-(with-test (:name (:return-from-thread :normal-thread)
+(with-test (:name (return-from-thread :normal-thread)
             :skipped-on '(not :sb-thread))
-  (let* ((thread (make-thread (lambda ()
-                                (return-from-thread (values 1 2 3))
-                                :foo)))
-         (values (multiple-value-list (join-thread thread))))
-    (unless (equal (list 1 2 3) values)
-      (error "got ~S, wanted (1 2 3)" values))))
+  (let ((thread (make-thread (lambda ()
+                               (return-from-thread (values 1 2 3))
+                               :foo))))
+    (assert (equal '(1 2 3) (multiple-value-list (join-thread thread))))))
 
-(with-test (:name (:return-from-thread :main-thread))
+(with-test (:name (return-from-thread :main-thread))
   (assert (main-thread-p))
-  (assert (eq :oops
-              (handler-case
-                  (return-from-thread t)
-                (thread-error ()
-                  :oops)))))
+  (assert-error (return-from-thread t) thread-error))
 
-(with-test (:name (:abort-thread :normal-thread)
+(with-test (:name (abort-thread :normal-thread)
             :skipped-on '(not :sb-thread))
   (let ((thread (make-thread (lambda ()
                                (abort-thread)
                                :foo))))
-    (assert (eq :aborted! (join-thread thread :default :aborted!)))))
+    (assert (equal '(:aborted! :abort)
+                   (multiple-value-list
+                    (join-thread thread :default :aborted!))))))
 
-(with-test (:name (:abort-thread :main-thread))
+(with-test (:name (abort-thread :main-thread))
   (assert (main-thread-p))
-  (assert (eq :oops
-              (handler-case
-                  (abort-thread)
-                (thread-error ()
-                  :oops)))))
+  (assert-error (abort-thread) thread-error))
 
 ;; SB-THREAD:MAKE-THREAD used to lock SB-THREAD:*MAKE-THREAD-LOCK*
 ;; before entering WITHOUT-INTERRUPTS. When a thread which was

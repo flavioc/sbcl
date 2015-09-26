@@ -111,6 +111,13 @@
                      ,label-2
                      (unless ,(first endlist) (go ,label-1))
                      (return-from ,block (progn ,@(rest endlist))))))))))
+
+;; Define "exchanged subtract" So that DECF on a symbol requires no LET binding:
+;;  (DECF I (EXPR)) -> (SETQ I (XSUBTRACT (EXPR) I))
+;; which meets the CLHS 5.1.3 requirement to eval (EXPR) prior to reading
+;; the old value of I. Formerly in 'setf' but too late to avoid full calls.
+(declaim (inline xsubtract))
+(defun xsubtract (a b) (- b a))
 
 ;;;; GENSYM tricks
 
@@ -135,28 +142,28 @@
 
 ;;; Return a list of N gensyms. (This is a common suboperation in
 ;;; macros and other code-manipulating code.)
-(declaim (ftype (function (index &optional t) (values list &optional))
+(declaim (ftype (function (unsigned-byte &optional t) (values list &optional))
                 make-gensym-list))
 (defun make-gensym-list (n &optional name)
-  (when (eq t name)
-    (break))
-  (if name
-      (loop repeat n collect (sb!xc:gensym (string name)))
-      (loop repeat n collect (sb!xc:gensym))))
+  (let ((arg (if name (string name) "G")))
+    (loop repeat n collect (sb!xc:gensym arg))))
 
 ;;;; miscellany
 
 ;;; Lots of code wants to get to the KEYWORD package or the
 ;;; COMMON-LISP package without a lot of fuss, so we cache them in
-;;; variables. TO DO: How much does this actually buy us? It sounds
-;;; sensible, but I don't know for sure that it saves space or time..
-;;; -- WHN 19990521
-;;;
-;;; (The initialization forms here only matter on the cross-compilation
-;;; host; In the target SBCL, these variables are set in cold init.)
-(declaim (type package *cl-package* *keyword-package*))
-(defglobal *cl-package*      (find-package "COMMON-LISP"))
-(defglobal *keyword-package* (find-package "KEYWORD"))
+;;; variables on the host, or use L-T-V forms on the target.
+(macrolet ((def-it (sym expr)
+             #+sb-xc-host
+             `(progn (declaim (type package ,sym))
+                     (defglobal ,sym ,expr))
+             #-sb-xc-host
+             ;; We don't need to declaim the type. FIND-PACKAGE
+             ;; returns a package, and L-T-V propagates types.
+             ;; It's ugly how it achieves that, but it's a separate concern.
+             `(define-symbol-macro ,sym (load-time-value ,expr t))))
+  (def-it *cl-package* (find-package "COMMON-LISP"))
+  (def-it *keyword-package* (find-package "KEYWORD")))
 
 ;;; Concatenate together the names of some strings and symbols,
 ;;; producing a symbol in the current package.
@@ -187,42 +194,53 @@
     (apply #'symbolicate things)))
 
 ;;; Access *PACKAGE* in a way which lets us recover when someone has
-;;; done something silly like (SETF *PACKAGE* :CL-USER). (Such an
-;;; assignment is undefined behavior, so it's sort of reasonable for
+;;; done something silly like (SETF *PACKAGE* :CL-USER) in unsafe code.
+;;; (Such an assignment is undefined behavior, so it's sort of reasonable for
 ;;; it to cause the system to go totally insane afterwards, but it's a
-;;; fairly easy mistake to make, so let's try to recover gracefully
-;;; instead.)
+;;; fairly easy mistake to make, so let's try to recover gracefully instead.)
 ;;; This function is called while compiling this file because DO-ANONYMOUS
 ;;; is a delayed-def!macro, the constructor for which calls SANE-PACKAGE.
 (eval-when (:load-toplevel :execute #+sb-xc-host :compile-toplevel)
 (defun sane-package ()
-  (let ((maybe-package *package*))
-    (cond ((and (packagep maybe-package)
+  ;; Perhaps it's possible for *PACKAGE* to be set to a non-package in some
+  ;; host Lisp, but in SBCL it isn't, and the PACKAGEP test below would be
+  ;; elided unless forced to be NOTINLINE.
+  (declare (notinline packagep))
+  (let* ((maybe-package *package*)
+         (packagep (packagep maybe-package)))
+    ;; And if we don't also always check for deleted packages - as was true
+    ;; when the "#+sb-xc-host" reader condition was absent - then half of the
+    ;; COND becomes unreachable, making this function merely return *PACKAGE*
+    ;; in the cross-compiler, producing a code deletion note.
+    (cond ((and packagep
                 ;; For good measure, we also catch the problem of
                 ;; *PACKAGE* being bound to a deleted package.
                 ;; Technically, this is not undefined behavior in itself,
                 ;; but it will immediately lead to undefined to behavior,
                 ;; since almost any operation on a deleted package is
                 ;; undefined.
-                #-sb-xc-host
-                (package-%name maybe-package))
+                ;; The "%" accessor avoids calling %FIND-PACKAGE-OR-LOSE,
+                ;; though it probably does not make much difference, if any.
+                (#+sb-xc-host package-name #-sb-xc-host package-%name
+                 maybe-package))
            maybe-package)
           (t
            ;; We're in the undefined behavior zone. First, munge the
            ;; system back into a defined state.
-           (let ((really-package (find-package :cl-user)))
+           (let ((really-package
+                  (load-time-value (find-package :cl-user) t)))
              (setf *package* really-package)
              ;; Then complain.
              (error 'simple-type-error
                     :datum maybe-package
                     :expected-type '(and package (satisfies package-name))
                     :format-control
-                    "~@<~S can't be a ~A: ~2I~_~S has been reset to ~S.~:>"
+                    "~@<~S can't be a ~A: ~2I~_It has been reset to ~S.~:>"
                     :format-arguments (list '*package*
-                                            (if (packagep maybe-package)
+                                            (if packagep
                                                 "deleted package"
                                                 (type-of maybe-package))
-                                            '*package* really-package))))))))
+                                            really-package))))))))
 
 ;;; Access *DEFAULT-PATHNAME-DEFAULTS*, issuing a warning if its value
 ;;; is silly. (Unlike the vaguely-analogous SANE-PACKAGE, we don't
@@ -364,3 +382,18 @@
 ;;; This is like DO, except it has no implicit NIL block.
 (def!macro do-anonymous (varlist endlist &rest body)
   (frob-do-body varlist endlist body 'let 'psetq 'do-anonymous (gensym)))
+
+;;; Anaphoric macros
+(defmacro awhen (test &body body)
+  `(let ((it ,test))
+     (when it ,@body)))
+
+(defmacro acond (&rest clauses)
+  (if (null clauses)
+      `()
+      (destructuring-bind ((test &body body) &rest rest) clauses
+        (let ((it (copy-symbol 'it)))
+          `(let ((,it ,test))
+             (if ,it
+                 (let ((it ,it)) (declare (ignorable it)) ,@body)
+                 (acond ,@rest)))))))

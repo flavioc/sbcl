@@ -152,6 +152,10 @@
   (progn (prin1 `(package = ,(package-name *package*)))
          (terpri))
 
+  ;; *RAW-SLOT-DATA-LIST* is essentially a compile-time constant
+  ;; but isn't dumpable as such because it has functions in it.
+  (show-and-call sb!kernel::!raw-slot-data-init)
+
   ;; Anyone might call RANDOM to initialize a hash value or something;
   ;; and there's nothing which needs to be initialized in order for
   ;; this to be initialized, so we initialize it right away.
@@ -172,7 +176,6 @@
   ;; the basic type machinery needs to be initialized before toplevel
   ;; forms run.
   (show-and-call !type-class-cold-init)
-  (show-and-call !typedefs-cold-init)
   (show-and-call !world-lock-cold-init)
   (show-and-call !classes-cold-init)
   (show-and-call !early-type-cold-init)
@@ -195,10 +198,10 @@
   (show-and-call sb!kernel::!set-up-structure-object-class)
 
   (dolist (x (nreverse *!reversed-cold-setf-macros*))
-    (apply #'!quietly-assign-setf-macro x))
+    (apply #'!quietly-defsetf x))
   (dolist (x (nreverse *!reversed-cold-defuns*))
-    (destructuring-bind (name &optional docstring . inline-expansion) x
-      (!%quietly-defun name docstring inline-expansion)))
+    (destructuring-bind (name . inline-expansion) x
+      (!%quietly-defun name inline-expansion)))
 
   ;; KLUDGE: Why are fixups mixed up with toplevel forms? Couldn't
   ;; fixups be done separately? Wouldn't that be clearer and better?

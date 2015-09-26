@@ -106,8 +106,7 @@
 (defmacro %coerce-name-to-fun (name &optional (lookup-fn 'find-fdefn))
   `(let* ((name ,name) (fdefn (,lookup-fn name)))
      (if fdefn
-         (truly-the function
-                    (values (sb!sys:%primitive sb!c:safe-fdefn-fun fdefn)))
+         (sb!c:safe-fdefn-fun fdefn)
          (error 'undefined-function :name name))))
 
 ;; Coerce CALLABLE (a function-designator) to a FUNCTION.
@@ -115,6 +114,11 @@
 ;; Extended-function-designators are not accepted,
 ;; This function is defknowned with 'explicit-check', and we avoid calling
 ;; SYMBOL-FUNCTION because that would do another check.
+;; It would be great if this could change its error message
+;; depending on the input to either:
+;;   "foo is not a function designator" if not a CALLABLE
+;;   "foo does not designate a currently defined function"
+;;    if a symbol does not satisfy FBOUNDP.
 (defun %coerce-callable-to-fun (callable)
   (etypecase callable
     (function callable)
@@ -141,12 +145,11 @@
 ;;; encapsulation for identification in case you need multiple
 ;;; encapsulations of the same name.
 (defun encapsulate (name type function)
-  (let ((fdefn (find-fdefn name)))
-    (unless (and fdefn (fdefn-fun fdefn))
-      (error 'undefined-function :name name))
-    (when (typep (fdefn-fun fdefn) 'generic-function)
+  (let* ((fdefn (find-fdefn name))
+         (underlying-fun (sb!c:safe-fdefn-fun fdefn)))
+    (when (typep underlying-fun 'generic-function)
       (return-from encapsulate
-        (encapsulate-generic-function (fdefn-fun fdefn) type function)))
+        (encapsulate-generic-function underlying-fun type function)))
     ;; We must bind and close over INFO. Consider the case where we
     ;; encapsulate (the second) an encapsulated (the first)
     ;; definition, and later someone unencapsulates the encapsulated
@@ -156,7 +159,7 @@
     ;; clobber the appropriate INFO structure to allow
     ;; basic-definition to be bound to the next definition instead of
     ;; an encapsulation that no longer exists.
-    (let ((info (make-encapsulation-info type (fdefn-fun fdefn))))
+    (let ((info (make-encapsulation-info type underlying-fun)))
       (setf (fdefn-fun fdefn)
             (named-lambda encapsulation (&rest args)
               (apply function (encapsulation-info-definition info)

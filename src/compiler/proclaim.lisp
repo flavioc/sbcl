@@ -31,101 +31,47 @@
       (let ((old (gethash name *free-vars*)))
         (when old (vars old))))))
 
-;;; Return a new POLICY containing the policy information represented
-;;; by the optimize declaration SPEC. Any parameters not specified are
-;;; defaulted from the POLICY argument.
-(declaim (ftype (function (list policy) (values policy list))
-                process-optimize-decl))
-(defun process-optimize-decl (spec policy)
-  (let ((result nil)
-        (specified-qualities))
-    ;; Add new entries from SPEC.
-    (dolist (q-and-v-or-just-q (cdr spec))
-      (multiple-value-bind (quality raw-value)
-          (if (atom q-and-v-or-just-q)
-              (values q-and-v-or-just-q 3)
-              (destructuring-bind (quality raw-value) q-and-v-or-just-q
-                (values quality raw-value)))
-        (cond ((not (policy-quality-name-p quality))
-               (or (policy-quality-deprecation-warning quality)
-                   (compiler-warn
-                    "~@<Ignoring unknown optimization quality ~S in:~_ ~S~:>"
-                    quality spec)))
-              ((not (typep raw-value 'policy-quality))
-               (compiler-warn "~@<Ignoring bad optimization value ~S in:~_ ~S~:>"
-                              raw-value spec))
-              (t
-               ;; we can't do this yet, because CLOS macros expand
-               ;; into code containing INHIBIT-WARNINGS.
-               #+nil
-               (when (eql quality 'inhibit-warnings)
-                 (compiler-style-warn "~S is deprecated: use ~S instead"
-                                      quality 'muffle-conditions))
-               (let* ((pair (cons quality raw-value))
-                      (found (member quality result :key #'car)))
-                 (push pair specified-qualities)
-                 (if found
-                     (rplaca found pair)
-                     (push pair result)))))))
-    ;; Add any nonredundant entries from old POLICY.
-    (dolist (old-entry policy)
-      (unless (assq (car old-entry) result)
-        (push old-entry result)))
-    ;; Voila.
-    (values (sort-policy result) specified-qualities)))
-
 (declaim (ftype (function (list list) list)
                 process-handle-conditions-decl))
 (defun process-handle-conditions-decl (spec list)
   (let ((new (copy-alist list)))
-    (dolist (clause (cdr spec))
+    (dolist (clause (cdr spec) new)
       (destructuring-bind (typespec restart-name) clause
-        (let ((ospec (rassoc restart-name new :test #'eq)))
+        (let ((type (compiler-specifier-type typespec))
+              (ospec (rassoc restart-name new :test #'eq)))
           (if ospec
-              (setf (car ospec)
-                    (type-specifier
-                     (type-union (specifier-type (car ospec))
-                                 (specifier-type typespec))))
-              (push (cons (type-specifier (specifier-type typespec))
-                          restart-name)
-                    new)))))
-    new))
+              (setf (car ospec) (type-union (car ospec) type))
+              (push (cons type restart-name) new)))))))
 
 (declaim (ftype (function (list list) list)
                 process-muffle-conditions-decl))
 (defun process-muffle-conditions-decl (spec list)
   (process-handle-conditions-decl
-   (cons 'handle-conditions
-         (mapcar (lambda (x) (list x 'muffle-warning)) (cdr spec)))
+   `(handle-conditions ((or ,@(cdr spec)) muffle-warning))
    list))
 
 (declaim (ftype (function (list list) list)
                 process-unhandle-conditions-decl))
 (defun process-unhandle-conditions-decl (spec list)
   (let ((new (copy-alist list)))
-    (dolist (clause (cdr spec))
+    (dolist (clause (cdr spec) new)
       (destructuring-bind (typespec restart-name) clause
         (let ((ospec (rassoc restart-name new :test #'eq)))
           (if ospec
-              (let ((type-specifier
-                     (type-specifier
-                      (type-intersection
-                       (specifier-type (car ospec))
-                       (specifier-type `(not ,typespec))))))
-                (if type-specifier
-                    (setf (car ospec) type-specifier)
-                    (setq new
-                          (delete restart-name new :test #'eq :key #'cdr))))
+              (let ((type (type-intersection
+                           (car ospec)
+                           (compiler-specifier-type `(not ,typespec)))))
+                (if (type= type *empty-type*)
+                    (setq new (delete restart-name new :test #'eq :key #'cdr))
+                    (setf (car ospec) type)))
               ;; do nothing?
-              nil))))
-    new))
+              nil))))))
 
 (declaim (ftype (function (list list) list)
                 process-unmuffle-conditions-decl))
 (defun process-unmuffle-conditions-decl (spec list)
   (process-unhandle-conditions-decl
-   (cons 'unhandle-conditions
-         (mapcar (lambda (x) (list x 'muffle-warning)) (cdr spec)))
+   `(unhandle-conditions ((or ,@(cdr spec)) muffle-warning))
    list))
 
 (declaim (ftype (function (list list) list)
@@ -163,7 +109,7 @@
         (setf (info :variable :always-bound name) info-value)
         (setf (info :variable :kind name) info-value))))
 
-(defun proclaim-type (name type where-from)
+(defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)
     (error "Cannot proclaim TYPE of a non-symbol: ~S" name))
 
@@ -173,11 +119,11 @@
       (let ((old-type (info :variable :type name)))
         (when (type/= type old-type)
           (type-proclamation-mismatch-warn
-           name (type-specifier old-type) (type-specifier type)))))
+           name (type-specifier old-type) type-specifier))))
     (setf (info :variable :type name) type
           (info :variable :where-from name) where-from)))
 
-(defun proclaim-ftype (name type where-from)
+(defun proclaim-ftype (name type type-specifier where-from)
   (unless (legal-fun-name-p name)
     (error "Cannot declare FTYPE of illegal function name ~S" name))
   (unless (csubtypep type (specifier-type 'function))
@@ -191,14 +137,14 @@
           ((not (type/= type old-type))) ; not changed
           ((not (info :function :info name)) ; not a known function
            (ftype-proclamation-mismatch-warn
-            name (type-specifier old-type) (type-specifier type)))
+            name (type-specifier old-type) type-specifier))
           ((csubtypep type old-type)) ; tighten known function type
           (t
            (cerror "Continue"
                    'ftype-proclamation-mismatch-error
                    :name name
                    :old (type-specifier old-type)
-                   :new (type-specifier type))))))
+                   :new type-specifier)))))
     ;; Now references to this function shouldn't be warned about as
     ;; undefined, since even if we haven't seen a definition yet, we
     ;; know one is planned.
@@ -239,6 +185,40 @@
     (warn-if-inline-failed/proclaim name newval)
     (setf (info :function :inlinep name) newval)))
 
+(defun check-deprecation-declaration (state since form)
+  (unless (typep state 'deprecation-state)
+    (error 'simple-type-error
+           :datum            state
+           :expected-type    'deprecation-state
+           :format-control   "~<In declaration ~S, ~S state is not a ~
+                              valid deprecation state. Expected one ~
+                              of ~{~A~^, ~}.~@:>"
+           :format-arguments (list form state
+                                   (rest (typexpand 'deprecation-state)))))
+  (multiple-value-call #'values
+    state (sb!impl::normalize-deprecation-since since)))
+
+(defun process-deprecation-declaration (thing state software version)
+  (destructuring-bind (namespace name &key replacement) thing
+    (let ((info (make-deprecation-info state software version replacement)))
+      (ecase namespace
+        (function
+         (when (eq state :final)
+           (sb!impl::setup-function-in-final-deprecation
+            software version name replacement))
+         (setf (info :function :deprecated name) info))
+        (variable
+         ;; TODO (check-variable-name name "deprecated variable declaration")
+         (when (eq state :final)
+           (sb!impl::setup-variable-in-final-deprecation
+            software version name replacement))
+         (setf (info :variable :deprecated name) info))
+        (type
+         (when (eq state :final)
+           (sb!impl::setup-type-in-final-deprecation
+            software version name replacement))
+         (setf (info :type :deprecated name) info))))))
+
 (defun process-declaration-declaration (name form)
   (unless (symbolp name)
     (error "In~%  ~S~%the declaration to be recognized is not a ~
@@ -252,35 +232,37 @@
 ;;; (TYPE FOO X Y) when FOO is a type specifier. This function
 ;;; implements that by converting (FOO X Y) to (TYPE FOO X Y).
 (defun canonized-decl-spec (decl-spec)
-  (let* ((id (first decl-spec))
-         (id-is-type (if (symbolp id)
-                         (info :type :kind id)
-                         ;; A cons might not be a valid type specifier,
-                         ;; but it can't be a declaration either.
-                         (or (consp id)
-                             (typep id 'class))))
-         (id-is-declared-decl (info :declaration :recognized id)))
-    ;; FIXME: Checking ID-IS-DECLARED is probably useless these days,
-    ;; since we refuse to use the same symbol as both a type name and
-    ;; recognized declaration name.
-    (cond ((and id-is-type id-is-declared-decl)
-           (compiler-error
-            "ambiguous declaration ~S:~%  ~
-             ~S was declared as a DECLARATION, but is also a type name."
-            decl-spec id))
-          (id-is-type
-           (list* 'type decl-spec))
-          (t
-           decl-spec))))
+  (let ((id (first decl-spec)))
+    (if (cond  ((symbolp id) (info :type :kind id))
+               ((listp id)
+                (let ((id (car id)))
+                  (and (symbolp id)
+                       (or (info :type :translator id)
+                           (info :type :kind id)))))
+               (t
+                ;; FIXME: should be (TYPEP id '(OR CLASS CLASSOID))
+                ;; but that references CLASS too soon.
+                ;; See related hack in DEF!TYPE TYPE-SPECIFIER.
+                (typep id 'instance)))
+        (cons 'type decl-spec)
+        decl-spec)))
+
+;; These return values are intended for EQ-comparison in
+;; STORE-LOCATION in %PROCLAIM.
+(defun deprecation-location-key (namespace)
+  (case namespace
+    (function '(deprecated function))
+    (variable '(deprecated variable))
+    (type     '(deprecated type))))
 
 (defun %proclaim (raw-form location)
   (destructuring-bind (&whole form &optional kind &rest args)
       (canonized-decl-spec raw-form)
-    (labels ((store-location (name)
+    (labels ((store-location (name &key (key kind))
                (if location
-                   (setf (getf (info :source-location :declaration name) kind)
+                   (setf (getf (info :source-location :declaration name) key)
                          location)
-                   (remf (info :source-location :declaration name) kind)))
+                   (remf (info :source-location :declaration name) key)))
              (map-names (names function &rest extra-args)
                (mapc (lambda (name)
                        (store-location name)
@@ -298,11 +280,12 @@
         ((type ftype)
          (if *type-system-initialized*
              (destructuring-bind (type &rest names) args
+               (check-deprecated-type type)
                (let ((ctype (specifier-type type)))
                  (map-names names (ecase kind
                                     (type #'proclaim-type)
                                     (ftype #'proclaim-ftype))
-                            ctype :declared)))
+                            ctype type :declared)))
              (push raw-form *queued-proclaims*)))
         (freeze-type
          (map-args #'process-freeze-type-declaration))
@@ -310,8 +293,7 @@
          (multiple-value-bind (new-policy specified-qualities)
              (process-optimize-decl form *policy*)
            (setq *policy* new-policy)
-           (advise-if-repeated-optimize-qualities
-            new-policy specified-qualities)))
+           (warn-repeated-optimize-qualities new-policy specified-qualities)))
         (muffle-conditions
          (setq *handled-conditions*
                (process-muffle-conditions-decl form *handled-conditions*)))
@@ -323,6 +305,17 @@
                (process-package-lock-decl form *disabled-package-locks*)))
         ((inline notinline maybe-inline)
          (map-args #'process-inline-declaration kind))
+        (deprecated
+         (destructuring-bind (state since &rest things) args
+           (multiple-value-bind (state software version)
+               (check-deprecation-declaration state since form)
+             (mapc (lambda (thing)
+                     (destructuring-bind (namespace name &rest rest) thing
+                       (declare (ignore rest))
+                       (store-location
+                        name :key (deprecation-location-key namespace)))
+                     (process-deprecation-declaration thing state software version))
+                   things))))
         (declaration
          (map-args #'process-declaration-declaration form))
         (t
@@ -336,15 +329,19 @@
   #+sb-xc (/show0 "returning from PROCLAIM")
   (values))
 
-(defun advise-if-repeated-optimize-qualities (new-policy specified-qualities)
+;; Issue a style warning if there are any repeated OPTIMIZE declarations
+;; given the SPECIFIED-QUALITIES, unless there is no ambiguity.
+(defun warn-repeated-optimize-qualities (new-policy specified-qualities)
   (let (dups)
     (dolist (quality-and-value specified-qualities)
       (let* ((quality (car quality-and-value))
-             (current (assq quality new-policy)))
-        (when (and (not (eql (cdr quality-and-value) (cdr current)))
+             (current ; Read the raw quality value, not the adjusted value.
+              (%%policy-quality new-policy (policy-quality-name-p quality))))
+        (when (and (not (eql (cdr quality-and-value) current))
                    (not (assq quality dups)))
-          (push `(,quality ,(cdr current)) dups))))
+          (push `(,quality ,current) dups))))
     (when dups
-      (compiler-style-warn
-       "Repeated OPTIMIZE qualit~@P. Using ~{~S~^ and ~}"
-       (length dups) dups))))
+      ;; If a restriction is in force, this message can be misleading,
+      ;; as the "effective" value isn't always what the message claims.
+      (compiler-style-warn "Repeated OPTIMIZE qualit~@P. Using ~{~S~^ and ~}"
+                           (length dups) dups))))

@@ -152,7 +152,9 @@
       (let ((form root)
             (current (rest rpath)))
         (loop
-          (when (atom form)
+         (when (sb!int:comma-p form)
+           (setf form (sb!int:comma-expr form)))
+         (when (atom form)
             (aver (null current))
             (return))
           (let ((head (first form)))
@@ -392,6 +394,30 @@ a STYLE-WARNING (or any more serious condition)."))
    "A condition type signalled when the compiler deletes code that the user
 has written, having proved that it is unreachable."))
 
+(define-condition compiler-macro-application-missed-warning
+    (style-warning)
+  ((count :initarg :count
+          :reader compiler-macro-application-missed-warning-count)
+   (function :initarg :function
+             :reader compiler-macro-application-missed-warning-function))
+  (:default-initargs
+   :count (missing-arg)
+    :function (missing-arg))
+  (:report
+   (lambda (condition stream)
+     ;; Grammar note - starting a sentence with a numeral is wrong.
+     (format stream
+             (!uncross-format-control
+              "~@<~@(~D~) call~:P to ~
+               ~/sb!impl:print-symbol-with-prefix/ ~
+               ~2:*~[~;was~:;were~] compiled before a compiler-macro ~
+               was defined for it. A declaration of NOTINLINE at the ~
+               call site~:P will eliminate this warning, as will ~
+               defining the compiler-macro before its first potential ~
+               use.~@:>")
+             (compiler-macro-application-missed-warning-count condition)
+             (compiler-macro-application-missed-warning-function condition)))))
+
 (macrolet ((with-condition ((condition datum args) &body body)
              (with-unique-names (block)
                `(block ,block
@@ -543,13 +569,10 @@ has written, having proved that it is unreachable."))
             ;; advantage of the (SATISFIES HANDLE-CONDITION-P)
             ;; handler, because if that doesn't handle it the ordinary
             ;; compiler handlers will trigger.
-            (typep
+            (would-muffle-p
              (ecase kind
                (:variable (make-condition 'warning))
-               ((:function :type) (make-condition 'style-warning)))
-             (car
-              (rassoc 'muffle-warning
-                      (lexenv-handled-conditions *lexenv*))))))
+               ((:function :type) (make-condition 'style-warning))))))
     (let* ((found (dolist (warning *undefined-warnings* nil)
                     (when (and (equal (undefined-warning-name warning) name)
                                (eq (undefined-warning-kind warning) kind))
@@ -585,7 +608,7 @@ has written, having proved that it is unreachable."))
 ;;
 (defun warn-if-compiler-macro-dependency-problem (name)
   (unless (sb!xc:compiler-macro-function name)
-    (let ((status (car (info :function :emitted-full-calls name))))
+    (let ((status (car (info :function :emitted-full-calls name)))) ; TODO use emitted-full-call-count?
       (when (and (integerp status) (oddp status))
         ;; Show the total number of calls, because otherwise the warning
         ;; would be worded rather obliquely: "N calls were compiled
@@ -594,13 +617,8 @@ has written, having proved that it is unreachable."))
         ;; This is why I don't bother collecting both statistics.
         ;; It's the tail wagging the dog: the message dictates what to track.
         (compiler-style-warn
-         ;; Grammar note - starting a sentence with a numeral is wrong.
-         (!uncross-format-control
-         "~@<~@(~D~) call~:P to ~/sb!impl:print-symbol-with-prefix/ ~2:*~[~;was~:;were~] ~
-compiled before a compiler-macro was defined for it. A declaration of ~
-NOTINLINE at the call site~:P will eliminate this warning, ~
-as will defining the compiler-macro before its first potential use.~@:>")
-         (ash status -2) name)))))
+         'compiler-macro-application-missed-warning
+         :count (ash status -2) :function name)))))
 
 ;; Inlining failure scenario 1 [at time of proclamation]:
 ;; Full call to F is emitted not in the scope of a NOTINLINE, with no definition

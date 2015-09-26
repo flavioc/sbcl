@@ -1123,26 +1123,15 @@
   (op    :field (byte 4 0))
   (label :field (byte 8 8) :type 'displacement))
 
-(sb!disassem:define-instruction-format (near-cond-jump 16)
+(sb!disassem:define-instruction-format (near-cond-jump 48)
   (op    :fields (list (byte 8 0) (byte 4 12)) :value '(#b00001111 #b1000))
   (cc    :field (byte 4 8) :type 'condition-code)
-  ;; The disassembler currently doesn't let you have an instruction > 32 bits
-  ;; long, so we fake it by using a prefilter to read the offset.
-  (label :type 'displacement
-         :prefilter (lambda (value dstate)
-                      (declare (ignore value)) ; always nil anyway
-                      (sb!disassem:read-signed-suffix 32 dstate))))
+  (label :field (byte 32 16) :type 'displacement))
 
-(sb!disassem:define-instruction-format (near-jump 8
+(sb!disassem:define-instruction-format (near-jump 40
                                      :default-printer '(:name :tab label))
   (op    :field (byte 8 0))
-  ;; The disassembler currently doesn't let you have an instruction > 32 bits
-  ;; long, so we fake it by using a prefilter to read the address.
-  (label :type 'displacement
-         :prefilter (lambda (value dstate)
-                      (declare (ignore value)) ; always nil anyway
-                      (sb!disassem:read-signed-suffix 32 dstate))))
-
+  (label :field (byte 32 8) :type 'displacement))
 
 (sb!disassem:define-instruction-format (cond-set 24
                                      :default-printer '('set cc :tab reg/mem))
@@ -2109,7 +2098,8 @@
      (emit-ea segment dst (reg-tn-encoding src)))))
 
 (define-instruction cmpxchg16b (segment mem &optional prefix)
-  (:printer ext-reg-reg/mem-no-width ((op #xC7)) '(:name :tab reg/mem))
+  (:printer ext-reg/mem-no-width
+            ((op '(#xC7 1))))
   (:emitter
    (aver (not (register-p mem)))
    (emit-prefix segment prefix)
@@ -2118,6 +2108,16 @@
    (emit-byte segment #xC7)
    (emit-ea segment mem 1))) ; operand extension
 
+(define-instruction rdrand (segment dst)
+  (:printer ext-reg/mem-no-width
+            ((op '(#xC7 6))))
+  (:emitter
+   (aver (register-p dst))
+   (maybe-emit-operand-size-prefix segment (operand-size dst))
+   (maybe-emit-rex-for-ea segment dst nil)
+   (emit-byte segment #x0F)
+   (emit-byte segment #xC7)
+   (emit-ea segment dst 6)))
 
 ;;;; flag control instructions
 
@@ -2545,8 +2545,12 @@
 (defun emit-optimized-test-inst (x y)
   (typecase y
     ((unsigned-byte 7)
+     ;; If we knew that the sign bit would not be tested, this could
+     ;; handle (unsigned-byte 8) constants. But since we don't know,
+     ;; we assume that it's not ok to change the test such that the S flag
+     ;; comes out possibly differently.
      (let ((offset (tn-offset x)))
-       (cond ((and (sc-is x any-reg descriptor-reg)
+       (cond ((and (sc-is x any-reg descriptor-reg signed-reg unsigned-reg)
                    (or (= offset rax-offset) (= offset rbx-offset)
                        (= offset rcx-offset) (= offset rdx-offset)))
               (inst test (reg-in-size x :byte) y))

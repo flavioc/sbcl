@@ -174,8 +174,7 @@
 (defmethod shared-initialize :before
            ((generic-function standard-generic-function)
             slot-names
-            &key (name nil namep)
-                 (lambda-list () lambda-list-p)
+            &key (lambda-list () lambda-list-p)
                  argument-precedence-order
                  declarations
                  documentation
@@ -184,9 +183,6 @@
   (declare (ignore slot-names
                    declarations argument-precedence-order documentation
                    lambda-list lambda-list-p))
-
-  (when namep
-    (set-fun-name generic-function name))
 
   (flet ((initarg-error (initarg value string)
            (error "when initializing the generic function ~S:~%~
@@ -302,6 +298,11 @@
    ;; at this point.  Since there's no ANSI-blessed way of getting an
    ;; EQL specializer, that seems unnecessarily painful, so we are
    ;; nice to our users.  -- CSR, 2007-06-01
+   ;; Note that INTERN-EQL-SPECIALIZER is exported from SB-MOP, but MOP isn't
+   ;; part of the ANSI standard. Parsing introduces a tiny semantic problem in
+   ;; the edge case of an EQL specializer whose object is literally (EQL :X).
+   ;; That one must be supplied as a pre-parsed #<EQL-SPECIALIZER> because if
+   ;; not, we'd parse it into a specializer whose object is :X.
    (parse-specializers generic-function specializers) errorp t))
 
 ;;; Compute various information about a generic-function's arglist by looking
@@ -475,14 +476,14 @@
 
 (defun real-add-method (generic-function method &optional skip-dfun-update-p)
   (flet ((similar-lambda-lists-p (old-method new-lambda-list)
-           (multiple-value-bind (a-nreq a-nopt a-keyp a-restp)
-               (analyze-lambda-list (method-lambda-list old-method))
-             (multiple-value-bind (b-nreq b-nopt b-keyp b-restp)
-                 (analyze-lambda-list new-lambda-list)
+           (binding* (((a-llks a-nreq a-nopt)
+                       (analyze-lambda-list (method-lambda-list old-method)))
+                      ((b-llks b-nreq b-nopt)
+                       (analyze-lambda-list new-lambda-list)))
                (and (= a-nreq b-nreq)
                     (= a-nopt b-nopt)
-                    (eq (or a-keyp a-restp)
-                        (or b-keyp b-restp)))))))
+                    (eq (ll-keyp-or-restp a-llks)
+                        (ll-keyp-or-restp b-llks))))))
     (multiple-value-bind (lock qualifiers specializers new-lambda-list
                           method-gf name)
         (values-for-add-method generic-function method)
@@ -580,6 +581,7 @@
 
 (defun real-remove-method (generic-function method)
   (when (eq generic-function (method-generic-function method))
+    (flush-effective-method-cache generic-function)
     (let ((lock (gf-lock generic-function)))
       ;; System lock because interrupts need to be disabled as well:
       ;; it would be bad to unwind and leave the gf in an inconsistent
@@ -619,26 +621,26 @@
                (gf-lambda-list (generic-function-lambda-list gf))
                (tfun (constantly t))
                keysp)
-          (multiple-value-bind (gf.required gf.optional gf.restp gf.rest
-                                            gf.keyp gf.keys gf.allowp)
+          (multiple-value-bind (llks gf.required gf.optional gf.rest gf.keys)
               (parse-lambda-list gf-lambda-list)
-            (declare (ignore gf.rest))
             ;; 7.6.4 point 5 probably entails that if any method says
             ;; &allow-other-keys then the gf should be construed to
             ;; accept any key.
-            (let* ((allowp (or gf.allowp
+            (let* ((allowp (or (ll-kwds-allowp llks)
                                (find '&allow-other-keys methods
                                      :test #'find
                                      :key #'method-lambda-list)))
                    (ftype
                     (specifier-type
+                     ;; SERIOUSLY? Do we not already have like at least
+                     ;; two other variations on this code?
                      `(function
                        (,@(mapcar tfun gf.required)
                           ,@(if gf.optional
                                 `(&optional ,@(mapcar tfun gf.optional)))
-                          ,@(if gf.restp
+                          ,@(if gf.rest
                                 `(&rest t))
-                          ,@(when gf.keyp
+                          ,@(when (ll-kwds-keyp llks)
                               (let ((all-keys
                                      (mapcar
                                       (lambda (x)
@@ -646,7 +648,7 @@
                                       (remove-duplicates
                                        (nconc
                                         (mapcan #'function-keywords methods)
-                                        (mapcar #'keyword-spec-name gf.keys))))))
+                                        (mapcar #'parse-key-arg-spec gf.keys))))))
                                 (when all-keys
                                   (setq keysp t)
                                   `(&key ,@all-keys))))
@@ -729,8 +731,15 @@
                                (specl2 class-eq-specializer))
   (eq (specializer-class specl1) (specializer-class specl2)))
 
+;; FIXME: This method is wacky, and indicative of a coding style in which
+;; metaphorically the left hand does not know what the right is doing.
+;; If you want this to be the abstract comparator, and you "don't know"
+;; that EQL-specializers are interned, then the comparator should be EQL.
+;; But if you *do* know that they're interned, then why does this method
+;; exist at all? The method on SPECIALIZER works fine.
 (defmethod same-specializer-p ((specl1 eql-specializer)
                                (specl2 eql-specializer))
+  ;; A bit of deception to confuse the enemy?
   (eq (specializer-object specl1) (specializer-object specl2)))
 
 (defmethod specializer-class ((specializer eql-specializer))
@@ -761,7 +770,7 @@
 
 (defun get-wrappers-from-classes (nkeys wrappers classes metatypes)
   (let* ((w wrappers) (w-tail w) (mt-tail metatypes))
-    (dolist (class (if (listp classes) classes (list classes)))
+    (dolist (class (ensure-list classes))
       (unless (eq t (car mt-tail))
         (let ((c-w (class-wrapper class)))
           (unless c-w (return-from get-wrappers-from-classes nil))
@@ -1682,28 +1691,26 @@
   new-value)
 
 (defmethod function-keywords ((method standard-method))
-  (multiple-value-bind (nreq nopt keysp restp allow-other-keys-p
-                        keywords)
+  (multiple-value-bind (llks nreq nopt keywords)
       (analyze-lambda-list (if (consp method)
                                (early-method-lambda-list method)
                                (method-lambda-list method)))
-    (declare (ignore nreq nopt keysp restp))
-    (values keywords allow-other-keys-p)))
+    (declare (ignore nreq nopt))
+    (values keywords (ll-kwds-allowp llks))))
 
 (defmethod function-keyword-parameters ((method standard-method))
-  (multiple-value-bind (nreq nopt keysp restp allow-other-keys-p
-                        keywords keyword-parameters)
+  (multiple-value-bind (llks nreq nopt keywords keyword-parameters)
       (analyze-lambda-list (if (consp method)
                                (early-method-lambda-list method)
                                (method-lambda-list method)))
-    (declare (ignore nreq nopt keysp restp keywords))
-    (values keyword-parameters allow-other-keys-p)))
+    (declare (ignore nreq nopt keywords))
+    (values keyword-parameters (ll-kwds-allowp llks))))
 
+;; FIXME: this is just: "parse, set keys to nil, unparse" (I think).
 (defun method-ll->generic-function-ll (ll)
-  (multiple-value-bind
-      (nreq nopt keysp restp allow-other-keys-p keywords keyword-parameters)
+  (multiple-value-bind (llks nreq nopt keywords keyword-parameters)
       (analyze-lambda-list ll)
-    (declare (ignore nreq nopt keysp restp allow-other-keys-p keywords))
+    (declare (ignore llks nreq nopt keywords))
     (remove-if (lambda (s)
                  (or (memq s keyword-parameters)
                      (eq s '&allow-other-keys)))
@@ -1724,8 +1731,8 @@
         (methods (generic-function-methods generic-function)))
     (if (null methods)
         gf-lambda-list
-        (multiple-value-bind (gf.required gf.optional gf.rest gf.keys gf.allowp)
-            (%split-arglist gf-lambda-list)
+        (multiple-value-bind (gf.llks gf.required gf.optional gf.rest gf.keys)
+            (parse-lambda-list gf-lambda-list :silent t)
           ;; Possibly extend the keyword parameters of the gf by
           ;; additional key parameters of its methods:
           (let ((methods.keys nil) (methods.allowp nil))
@@ -1735,7 +1742,7 @@
                 (setq methods.keys (union methods.keys m.keyparams :key #'maybe-car))
                 (setq methods.allowp (or methods.allowp m.allow-other-keys))))
             (let ((arglist '()))
-              (when (or gf.allowp methods.allowp)
+              (when (or (ll-kwds-allowp gf.llks) methods.allowp)
                 (push '&allow-other-keys arglist))
               (when (or gf.keys methods.keys)
                 ;; We make sure that the keys of the gf appear before
@@ -1745,7 +1752,7 @@
                                      (nset-difference methods.keys gf.keys)
                                      arglist)))
               (when gf.rest
-                (setq arglist (nconc (list '&rest gf.rest) arglist)))
+                (setq arglist (nconc (cons '&rest gf.rest) arglist)))
               (when gf.optional
                 (setq arglist (nconc (list '&optional) gf.optional arglist)))
               (nconc gf.required arglist)))))))
@@ -1754,14 +1761,3 @@
   (if (listp thing)
       (car thing)
       thing))
-
-
-(defun %split-arglist (lambda-list)
-  ;; This function serves to shrink the number of returned values of
-  ;; PARSE-LAMBDA-LIST to something handier.
-  (multiple-value-bind (required optional restp rest keyp keys allowp
-                        auxp aux morep more-context more-count)
-      (parse-lambda-list lambda-list :silent t)
-    (declare (ignore restp keyp auxp aux morep))
-    (declare (ignore more-context more-count))
-    (values required optional rest keys allowp)))

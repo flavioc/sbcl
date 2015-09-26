@@ -25,9 +25,15 @@
   (and (lvar-p thing)
        (or (let ((use (principal-lvar-use thing)))
              (and (ref-p use) (constant-p (ref-leaf use))))
-           ;; check for EQL types (but not singleton numeric types)
-           (let ((type (lvar-type thing)))
-             (values (type-singleton-p type))))))
+           ;; check for EQL types and singleton numeric types
+           (values (type-singleton-p (lvar-type thing))))))
+
+;;; Same as above except for EQL types
+(defun strictly-constant-lvar-p (thing)
+  (declare (type (or lvar null) thing))
+  (and (lvar-p thing)
+       (let ((use (principal-lvar-use thing)))
+         (and (ref-p use) (constant-p (ref-leaf use))))))
 
 ;;; Return the constant value for an LVAR whose only use is a constant
 ;;; node.
@@ -1379,6 +1385,25 @@
               (pushnew reason (cdr assoc)))
             (throw 'give-up-ir1-transform :delayed)))))
 
+;;; Poor man's catching and resignalling
+;;; Implicit %GIVE-UP macrolet will resignal the give-up "condition"
+(defmacro catch-give-up-ir1-transform ((form &optional args) &body gave-up-body)
+  (let ((block (gensym "BLOCK"))
+        (kind (gensym "KIND"))
+        (args (or args (gensym "ARGS"))))
+    `(block ,block
+       (multiple-value-bind (,kind ,args)
+           (catch 'give-up-ir1-transform
+             (return-from ,block ,form))
+         (ecase ,kind
+           (:delayed
+            (throw 'give-up-ir1-transform :delayed))
+           ((:failure :aborted)
+            (macrolet ((%give-up ()
+                         `(throw 'give-up-ir1-transform (values ,',kind
+                                                                ,',args))))
+              ,@gave-up-body)))))))
+
 ;;; Clear any delayed transform with no reasons - these should have
 ;;; been tried in the last pass. Then remove the reason from the
 ;;; delayed transform reasons, and if any become empty then set
@@ -1732,7 +1757,13 @@
                    (multiple-value-bind (pdest pprev)
                        (principal-lvar-end lvar)
                      (declare (ignore pdest))
-                     (lvar-single-value-p pprev))))
+                     (lvar-single-value-p pprev))
+                   ;; CASTs can disappear, don't substitute if
+                   ;; DEST-LVAR has other uses (this will be
+                   ;; insufficient if we have a CAST-CAST chain, but
+                   ;; works well for a single CAST)
+                   (or (null dest-lvar)
+                       (atom (lvar-uses dest-lvar)))))
              (mv-combination
               (or (eq (basic-combination-fun dest) lvar)
                   (and (eq (basic-combination-kind dest) :local)
@@ -2119,7 +2150,7 @@
           (dolist (val vals)
             (when types
               (let ((type (pop types)))
-                (assert-lvar-type val type '((type-check . 0)))))))
+                (assert-lvar-type val type **zero-typecheck-policy**)))))
         ;; Propagate declared types of MV-BIND variables.
         (propagate-to-args use fun)
         (reoptimize-call use))

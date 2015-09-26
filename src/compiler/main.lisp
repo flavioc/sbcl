@@ -782,74 +782,6 @@ necessary, since type inference may take arbitrarily long to converge.")
   (terpri)
   (values))
 
-;;;; file reading
-;;;;
-;;;; When reading from a file, we have to keep track of some source
-;;;; information. We also exploit our ability to back up for printing
-;;;; the error context and for recovering from errors.
-;;;;
-;;;; The interface we provide to this stuff is the stream-oid
-;;;; SOURCE-INFO structure. The bookkeeping is done as a side effect
-;;;; of getting the next source form.
-
-;;; A FILE-INFO structure holds all the source information for a
-;;; given file.
-(def!struct (file-info
-             (:copier nil)
-             #-no-ansi-print-object
-             (:print-object (lambda (s stream)
-                              (print-unreadable-object (s stream :type t)
-                                (princ (file-info-name s) stream)))))
-  ;; If a file, the truename of the corresponding source file. If from
-  ;; a Lisp form, :LISP. If from a stream, :STREAM.
-  (name (missing-arg) :type (or pathname (eql :lisp)))
-  ;; the external format that we'll call OPEN with, if NAME is a file.
-  (external-format nil)
-  ;; the defaulted, but not necessarily absolute file name (i.e. prior
-  ;; to TRUENAME call.) Null if not a file. This is used to set
-  ;; *COMPILE-FILE-PATHNAME*, and if absolute, is dumped in the
-  ;; debug-info.
-  (untruename nil :type (or pathname null))
-  ;; the file's write date (if relevant)
-  (write-date nil :type (or unsigned-byte null))
-  ;; the source path root number of the first form in this file (i.e.
-  ;; the total number of forms converted previously in this
-  ;; compilation)
-  (source-root 0 :type unsigned-byte)
-  ;; parallel vectors containing the forms read out of the file and
-  ;; the file positions that reading of each form started at (i.e. the
-  ;; end of the previous form)
-  (forms (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t))
-  (positions (make-array 10 :fill-pointer 0 :adjustable t) :type (vector t))
-  ;; A vector of character ranges than span each subform in the TLF,
-  ;; reset to empty for each one, updated by form-tracking-stream-observer.
-  (subforms nil :type (or null (vector t)) :read-only t))
-
-;;; The SOURCE-INFO structure provides a handle on all the source
-;;; information for an entire compilation.
-(def!struct (source-info
-             #-no-ansi-print-object
-             (:print-object (lambda (s stream)
-                              (print-unreadable-object
-                                  (s stream :type t :identity t))))
-             (:copier nil))
-  ;; the UT that compilation started at
-  (start-time (get-universal-time) :type unsigned-byte)
-  ;; the IRT that compilation started at
-  (start-real-time (get-internal-real-time) :type unsigned-byte)
-  ;; the FILE-INFO structure for this compilation
-  (file-info nil :type (or file-info null))
-  ;; the stream that we are using to read the FILE-INFO, or NIL if
-  ;; no stream has been opened yet
-  (stream nil :type (or stream null))
-  ;; for coalescing DEFINITION-SOURCE-LOCATION of effectively toplevel forms
-  ;; inside one truly toplevel form.
-  (last-defn-source-loc)
-  ;; if the current compilation is recursive (e.g., due to EVAL-WHEN
-  ;; processing at compile-time), the invoking compilation's
-  ;; source-info.
-  (parent nil :type (or source-info null)))
-
 ;;; Given a pathname, return a SOURCE-INFO structure.
 (defun make-file-source-info (file external-format &optional form-tracking-p)
   (make-source-info
@@ -1330,9 +1262,11 @@ necessary, since type inference may take arbitrarily long to converge.")
     (if (null *macro-policy*)
         (frob)
         (let* ((*lexenv*
-                (make-lexenv :policy (process-optimize-decl (macro-policy-decls nil)
-                                                            (lexenv-policy *lexenv*))
-                             :default *lexenv*))
+                (make-lexenv
+                 :policy (process-optimize-decl
+                          `(optimize ,@(policy-to-decl-spec *macro-policy*))
+                          (lexenv-policy *lexenv*))
+                 :default *lexenv*))
                ;; In case a null lexenv is created, it needs to get the newly
                ;; effective global policy, not the policy currently in *POLICY*.
                (*policy* (lexenv-policy *lexenv*)))
@@ -1494,19 +1428,35 @@ necessary, since type inference may take arbitrarily long to converge.")
 
 ;;; Compile FORM and arrange for it to be called at load-time. Return
 ;;; the dumper handle and our best guess at the type of the object.
+;;; It would be nice if L-T-V forms were generally eligible
+;;; for fopcompilation, as it could eliminate special cases below.
 (defun compile-load-time-value (form)
-  ;; Special case for the cross-compiler. While the normal ltv stuff is fine
-  ;; for the most part, it is inadequate for SETUP-PRINTER-STATE.
-  ;; In cold-init we want the printer to work before regular ltv forms are run,
-  ;; so this is fop-based magic, slightly dangerous in that it can produce a
-  ;; use of #'F before the referenced function has been defined.
-  ;; Just be careful not to do that.
-  #+sb-xc-host
-  (when (typep form '(cons (eql function) (cons symbol null)))
-    (fopcompile form nil t)
-    (return-from compile-load-time-value
-      (values (sb!fasl::dump-pop *compile-object*)
-              (specifier-type 'function))))
+  (let ((ctype
+         (cond
+          ;; Ideally any ltv would test FOPCOMPILABLE-P on its form,
+          ;; but be that as it may, this case is picked off because of
+          ;; its importance during cross-compilation to ensure that
+          ;; compiled lambdas don't cause a chicken-and-egg problem.
+          ((typep form '(cons (eql find-package) (cons string null)))
+           (specifier-type 'package))
+          #+sb-xc-host
+          ((typep form '(cons (eql find-classoid-cell)
+                              (cons (cons (eql quote)))))
+           (aver (eq (getf (cddr form) :create) t))
+           (specifier-type 'sb!kernel::classoid-cell))
+          ;; Special case for the cross-compiler, necessary for at least
+          ;; SETUP-PRINTER-STATE, but also anything that would be dumped
+          ;; using FOP-KNOWN-FUN in the target compiler, to avoid going
+          ;; through an fdefn.
+          ;; I'm pretty sure that as of change 00298ec6, it works to
+          ;; compile #'F before the defun would have been seen by Genesis.
+          #+sb-xc-host
+          ((typep form '(cons (eql function) (cons symbol null)))
+           (specifier-type 'function)))))
+    (when ctype
+      (fopcompile form nil t)
+      (return-from compile-load-time-value
+        (values (sb!fasl::dump-pop *compile-object*) ctype))))
   (let ((lambda (compile-load-time-stuff form t)))
     (values
      (fasl-dump-load-time-value-lambda lambda *compile-object*)
@@ -1640,44 +1590,51 @@ necessary, since type inference may take arbitrarily long to converge.")
     (setq *block-compile* nil)
     (setq *entry-points* nil)))
 
-(defun handle-condition-p (condition)
-  (let ((lexenv
-         (etypecase *compiler-error-context*
-           (node
-            (node-lexenv *compiler-error-context*))
-           (compiler-error-context
-            (let ((lexenv (compiler-error-context-lexenv
-                           *compiler-error-context*)))
-              (aver lexenv)
-              lexenv))
-           (null *lexenv*))))
-    (let ((muffles (lexenv-handled-conditions lexenv)))
-      (if (null muffles) ; common case
-          nil
-          (dolist (muffle muffles nil)
-            (destructuring-bind (typespec . restart-name) muffle
-              (when (and (typep condition typespec)
-                         (find-restart restart-name condition))
-                (return t))))))))
+(flet ((get-handled-conditions ()
+         (let ((ctxt *compiler-error-context*))
+           (lexenv-handled-conditions
+            (etypecase ctxt
+             (node (node-lexenv ctxt))
+             (compiler-error-context
+              (let ((lexenv (compiler-error-context-lexenv ctxt)))
+                (aver lexenv)
+                lexenv))
+             ;; Is this right? I would think that if lexenv is null
+             ;; we should look at *HANDLED-CONDITIONS*.
+             (null *lexenv*)))))
+       (handle-p (condition ctype)
+         #+sb-xc-host (typep condition (type-specifier ctype))
+         #-sb-xc-host (%%typep condition ctype)))
+  (declare (inline handle-p))
 
-(defun handle-condition-handler (condition)
-  (let ((lexenv
-         (etypecase *compiler-error-context*
-           (node
-            (node-lexenv *compiler-error-context*))
-           (compiler-error-context
-            (let ((lexenv (compiler-error-context-lexenv
-                           *compiler-error-context*)))
-              (aver lexenv)
-              lexenv))
-           (null *lexenv*))))
-    (let ((muffles (lexenv-handled-conditions lexenv)))
-      (aver muffles)
+  (defun handle-condition-p (condition)
+    (dolist (muffle (get-handled-conditions) nil)
+      (destructuring-bind (ctype . restart-name) muffle
+        (when (and (handle-p condition ctype)
+                   (find-restart restart-name condition))
+          (return t)))))
+
+  (defun handle-condition-handler (condition)
+    (let ((muffles (get-handled-conditions)))
+      (aver muffles) ; FIXME: looks redundant with "fell through"
       (dolist (muffle muffles (bug "fell through"))
-        (destructuring-bind (typespec . restart-name) muffle
-          (when (typep condition typespec)
+        (destructuring-bind (ctype . restart-name) muffle
+          (when (handle-p condition ctype)
             (awhen (find-restart restart-name condition)
-              (invoke-restart it))))))))
+              (invoke-restart it)))))))
+
+  ;; WOULD-MUFFLE-P is called (incorrectly) only by NOTE-UNDEFINED-REFERENCE.
+  ;; It is not wrong per se, but as used, it is wrong, making it nearly
+  ;; impossible to muffle a subset of undefind warnings whose NAME and KIND
+  ;; slots match specific things tested by a user-defined predicate.
+  ;; Attempting to do that might muffle everything, depending on how your
+  ;; predicate responds to a vanilla WARNING. Consider e.g.
+  ;;   (AND WARNING (NOT (SATISFIES HAIRYFN)))
+  ;; where HAIRYFN depends on the :FORMAT-CONTROL and :FORMAT-ARGUMENTS.
+  (defun would-muffle-p (condition)
+    (let ((ctype (rassoc 'muffle-warning
+                         (lexenv-handled-conditions *lexenv*))))
+      (and ctype (handle-p condition (car ctype))))))
 
 ;;; Read all forms from INFO and compile them, with output to OBJECT.
 ;;; Return (VALUES ABORT-P WARNINGS-P FAILURE-P).

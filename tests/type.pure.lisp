@@ -11,6 +11,10 @@
 
 (in-package "CL-USER")
 
+(test-util:with-test (:name :typexpand-check-lexenv)
+  (flet ((try (f) (assert-error (funcall f 'hash-table 3))))
+    (mapc #'try '(typexpand-1 typexpand typexpand-all))))
+
 (locally
   (declare (notinline mapcar))
   (mapcar (lambda (args)
@@ -515,7 +519,7 @@
 (with-test (:name :parse-safely)
   (dolist (x '(array integer cons))
     (assert (handler-case (sb-kernel:specifier-type `(,x . 0))
-              (type-error () t)
+              (sb-kernel::arg-count-error () t)
               (error (c) (print c) nil)))))
 
 (with-test (:name :unparse-safely)
@@ -529,6 +533,33 @@
     ;; and not *wild-type*
     (assert (sb-kernel:type/= (sb-kernel:array-type-specialized-element-type intersection)
                               (sb-kernel:specifier-type 'bit)))))
+
+;; lp#1333731
+(with-test (:name :adjust-array-changes-type-of)
+  (let ((a (make-array 10 :adjustable t)))
+    (assert (equal (type-of a) '(vector t 10)))
+    (adjust-array a 20)
+    (assert (equal (type-of a) '(vector t 20)))))
+
+
+(with-test (:name :unknown-type-strongly-uncacheable)
+  ;; VALUES-SPECIFIER-TYPE should not cache a specifier any part of which
+  ;; is unknown. This leads to consistent results when parsing unknown
+  ;; types. Previously it was indeterminate whether a condition would
+  ;; be signaled for (OR UNKNOWN KNOWN) depending on whether that expression
+  ;; had ever been parsed and whether it had been evicted from the cache.
+  (assert-signal (progn (sb-kernel:specifier-type '(or weeble ratio))
+                        (sb-kernel:specifier-type '(or weeble ratio)))
+                 sb-kernel:parse-unknown-type 2) ; expect 2 signals
+  (assert-signal (progn (sb-kernel:specifier-type '(and potrzebie real))
+                        (sb-kernel:specifier-type '(and potrzebie real)))
+                 sb-kernel:parse-unknown-type 2) ; expect 2 signals
+  (assert-signal (progn (sb-kernel:specifier-type '(array strudel))
+                        (sb-kernel:specifier-type '(array strudel)))
+                 sb-kernel:parse-unknown-type 2) ; expect 2 signals
+  (assert-signal (progn (sb-kernel:specifier-type '(not bad))
+                        (sb-kernel:specifier-type '(not bad)))
+                 sb-kernel:parse-unknown-type 2)) ; expect 2 signals
 
 (in-package "SB-KERNEL")
 (test-util:with-test (:name :partition-array-into-simple/hairy)
@@ -566,3 +597,36 @@
                    '(not (or (and simple-array (not vector))
                              (and array (not simple-array))))))
                  (specifier-type 'simple-string))))
+
+(test-util:with-test (:name :classoids-as-type-specifiers)
+  (dolist (classoid (list (find-classoid 'integer)
+                          (find-class 'integer)))
+    ;; Classoids and classes should work as type specifiers
+    ;; in the atom form, not as lists.
+    ;; Their legality or lack thereof is equivalent in all cases.
+    (flet ((expect-win (type)
+             (multiple-value-bind (f warn err)
+                 (compile nil `(lambda (x) (declare (,type x)) x))
+               (assert (and f (not warn) (not err))))
+             (multiple-value-bind (f warn err)
+                 (compile nil `(lambda (x) (declare (type ,type x)) x))
+               (assert (and f (not warn) (not err))))))
+      (expect-win classoid))
+    ;; Negative tests come in two flavors:
+    ;; In the case of (DECLARE (TYPE ...)), parsing the following thing
+    ;; as a type should fail. But when 'TYPE is implied, "canonization"
+    ;; should do nothing, because the following form is not a type,
+    ;; so we get an error about an unrecognized declaration instead.
+    (flet ((expect-lose (type)
+             (multiple-value-bind (f warn err)
+                 (let ((*error-output* (make-broadcast-stream)))
+                   (compile nil `(lambda (x) (declare (,type x)) x)))
+               (declare (ignore f warn))
+               (assert err))
+             (multiple-value-bind (f warn err)
+                 (let ((*error-output* (make-broadcast-stream)))
+                   (compile nil `(lambda (x) (declare (type ,type x)) x)))
+               (declare (ignore f warn))
+               (assert err))))
+      (expect-lose `(,classoid))
+      (expect-lose `(,classoid 1 100)))))

@@ -391,12 +391,6 @@
              result)
           (rplacd tail (list (car more)))))))
 
-(define-compiler-macro append (&whole form &rest lists)
-  (case (length lists)
-    (0 nil)
-    (1 (car lists))
-    (2 `(append2 ,@lists))
-    (t form)))
 
 ;;;; list copying functions
 
@@ -1243,26 +1237,36 @@
 ;;; way. It is done when any of the arglists runs out. Until then, it
 ;;; CDRs down the arglists calling the function and accumulating
 ;;; results as desired.
-(defun map1 (fun-designator original-arglists accumulate take-car)
-  (let ((fun (%coerce-callable-to-fun fun-designator)))
-    (let* ((arglists (copy-list original-arglists))
-           (ret-list (list nil))
-           (temp ret-list))
-      (do ((res nil)
-           (args '() '()))
-          ((dolist (x arglists nil) (if (null x) (return t)))
-           (if accumulate
-               (cdr ret-list)
-               (car original-arglists)))
-        (do ((l arglists (cdr l)))
-            ((null l))
-          (push (if take-car (caar l) (car l)) args)
-          (setf (car l) (cdar l)))
-        (setq res (apply fun (nreverse args)))
-        (case accumulate
-          (:nconc (setq temp (last (nconc temp res))))
-          (:list (rplacd temp (list res))
-                 (setq temp (cdr temp))))))))
+(defun map1 (fun-designator arglists accumulate take-car)
+  (do* ((fun (%coerce-callable-to-fun fun-designator))
+        (non-acc-result (car arglists))
+        (ret-list (list nil))
+        (temp ret-list)
+        (res nil)
+        (args (make-list (length arglists))))
+       ((dolist (x arglists) (or x (return t)))
+        (if accumulate
+            (cdr ret-list)
+            non-acc-result))
+    (do ((l arglists (cdr l))
+         (arg args (cdr arg)))
+        ((null l))
+      (setf (car arg) (if take-car (caar l) (car l)))
+      (setf (car l) (cdar l)))
+    (setq res (apply fun args))
+    (case accumulate
+      (:nconc
+       (when res
+         (setf (cdr temp) res)
+         ;; KLUDGE: it is said that MAPCON is equivalent to
+         ;; (apply #'nconc (maplist ...)) which means (nconc 1) would
+         ;; return 1, but (nconc 1 1) should signal an error.
+         ;; The transformed MAP code returns the last result, do that
+         ;; here as well for consistency and simplicity.
+         (when (consp res)
+           (setf temp (last res)))))
+      (:list (setf (cdr temp) (list res)
+                   temp (cdr temp))))))
 
 (defun mapc (function list &rest more-lists)
   #!+sb-doc

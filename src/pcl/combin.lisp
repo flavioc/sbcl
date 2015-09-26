@@ -462,12 +462,12 @@
 (defun compute-applicable-keywords (gf methods)
   (let ((any-keyp nil))
     (flet ((analyze (lambda-list)
-             (multiple-value-bind (nreq nopt keyp restp allowp keys)
+             (multiple-value-bind (llks nreq nopt keys)
                  (analyze-lambda-list lambda-list)
-               (declare (ignore nreq restp))
-               (when keyp
+               (declare (ignore nreq))
+               (when (ll-kwds-keyp llks)
                  (setq any-keyp t))
-               (values nopt allowp keys))))
+               (values nopt (ll-kwds-allowp llks) keys))))
       (multiple-value-bind (nopt allowp keys)
           (analyze (generic-function-lambda-list gf))
         (dolist (method methods)
@@ -537,14 +537,14 @@
                                      applicable-methods))
 
 (defun invalid-method-error (method format-control &rest format-arguments)
-  (let ((sb-debug:*stack-top-hint* (nth-value 1 (find-caller-name-and-frame))))
+  (let ((sb-debug:*stack-top-hint* (find-caller-frame)))
     (error "~@<invalid method error for ~2I~_~S ~I~_method: ~2I~_~?~:>"
            method
            format-control
            format-arguments)))
 
 (defun method-combination-error (format-control &rest format-arguments)
-  (let ((sb-debug:*stack-top-hint* (nth-value 1 (find-caller-name-and-frame))))
+  (let ((sb-debug:*stack-top-hint* (find-caller-frame)))
     (error "~@<method combination error in CLOS dispatch: ~2I~_~?~:>"
            format-control
            format-arguments)))

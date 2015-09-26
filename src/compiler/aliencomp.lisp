@@ -611,6 +611,36 @@
     `(lambda (function ,@names)
        (alien-funcall (deref function) ,@names))))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *saved-fp-and-pcs* nil)
+  ;; Can't use DECLAIM since always-bound is a non-standard declaration
+  (sb!xc:proclaim '(sb!ext:always-bound *saved-fp-and-pcs*)))
+
+#!+c-stack-is-control-stack
+(declaim (inline invoke-with-saved-fp-and-pc))
+#!+c-stack-is-control-stack
+(defun invoke-with-saved-fp-and-pc (fn)
+  (declare #-sb-xc-host (muffle-conditions compiler-note)
+           (optimize (speed 3)))
+  (let ((fp-and-pc (make-array 2 :element-type 'word)))
+    (declare (truly-dynamic-extent fp-and-pc))
+    (setf (aref fp-and-pc 0) (sb!kernel:get-lisp-obj-address
+                              (sb!kernel:%caller-frame))
+          (aref fp-and-pc 1) (sap-int (sb!kernel:%caller-pc)))
+    (let ((*saved-fp-and-pcs* (cons fp-and-pc *saved-fp-and-pcs*)))
+      (declare (truly-dynamic-extent *saved-fp-and-pcs*))
+      (funcall fn))))
+
+(defun find-saved-fp-and-pc (fp)
+  (dolist (x *saved-fp-and-pcs*)
+    (declare (type (simple-array word (2)) x))
+    (when (#!+stack-grows-downward-not-upward
+           sap>
+           #!-stack-grows-downward-not-upward
+           sap<
+           (int-sap (aref x 0)) fp)
+      (return (values (int-sap (aref x 0)) (int-sap (aref x 1)))))))
+
 (deftransform alien-funcall ((function &rest args) * * :node node :important t)
   (let ((type (lvar-type function)))
     (unless (alien-type-type-p type)
@@ -668,7 +698,7 @@
             ;; Remember this frame to make sure that we can get back
             ;; to it later regardless of how the foreign stack looks
             ;; like.
-            #!+:c-stack-is-control-stack
+            #!+c-stack-is-control-stack
             (when (policy node (= 3 alien-funcall-saves-fp-and-pc))
               (setf body `(invoke-with-saved-fp-and-pc (lambda () ,body))))
             (/noshow "returning from DEFTRANSFORM ALIEN-FUNCALL" (params) body)
@@ -716,14 +746,19 @@
         ;; deal with all of the stack arguments before the wired
         ;; register arguments become live.
         (args #!-arm args #!+arm (reverse args))
-        #!+x86
+        #!+c-stack-is-control-stack
         (stack-pointer (make-stack-pointer-tn)))
     (multiple-value-bind (nsp stack-frame-size arg-tns result-tns)
         (make-call-out-tns type)
       #!+x86
-      (progn
-        (vop set-fpu-word-for-c call block)
-        (vop current-stack-pointer call block stack-pointer))
+      (vop set-fpu-word-for-c call block)
+      ;; Save the stack pointer, it will get aligned and subtracting
+      ;; the size will not restore the original value, and some
+      ;; things, like SB-C::CALL-VARIABLE, use the stack pointer to
+      ;; calculate the number of saved values.
+      ;; See alien.impure.lisp/:stack-misalignment
+      #!+c-stack-is-control-stack
+      (vop current-stack-pointer call block stack-pointer)
       (vop alloc-number-stack-space call block stack-frame-size nsp)
       ;; KLUDGE: This is where the second half of the ARM
       ;; register-pressure change lives (see above).
@@ -782,28 +817,25 @@
                   (vop sb!vm::move-single-to-int-arg call block
                        float-tn i1-tn))))))
       (aver (null args))
-      (unless (listp result-tns)
-        (setf result-tns (list result-tns)))
-      (let ((arg-tns (remove-if-not #'tn-p (flatten-list arg-tns)))
-            (result-tns (remove-if-not #'tn-p result-tns)))
+      (let ((result-tns (ensure-list result-tns)))
         (vop* call-out call block
               ((lvar-tn call block function)
-               (reference-tn-list arg-tns nil))
-              ((reference-tn-list result-tns t))))
-      #!-x86
-      (vop dealloc-number-stack-space call block stack-frame-size)
-      #!+x86
-      (progn
+               (reference-tn-list (remove-if-not #'tn-p (flatten-list arg-tns)) nil))
+              ((reference-tn-list (remove-if-not #'tn-p result-tns) t)))
+        #!-c-stack-is-control-stack
+        (vop dealloc-number-stack-space call block stack-frame-size)
+        #!+c-stack-is-control-stack
         (vop reset-stack-pointer call block stack-pointer)
-        (vop set-fpu-word-for-lisp call block))
-      (cond
-        #!+arm-softfp
-        ((and lvar
-              (proper-list-of-length-p result-tns 3)
-              (symbolp (third result-tns)))
-         (emit-template call block
-                        (template-or-lose (third result-tns))
-                        (reference-tn-list (butlast result-tns) nil)
-                        (reference-tn (car (ir2-lvar-locs (lvar-info lvar))) t)))
-        (t
-         (move-lvar-result call block result-tns lvar))))))
+        #!+x86
+        (vop set-fpu-word-for-lisp call block)
+        (cond
+          #!+arm-softfp
+          ((and lvar
+                (proper-list-of-length-p result-tns 3)
+                (symbolp (third result-tns)))
+           (emit-template call block
+                          (template-or-lose (third result-tns))
+                          (reference-tn-list (butlast result-tns) nil)
+                          (reference-tn (car (ir2-lvar-locs (lvar-info lvar))) t)))
+          (t
+           (move-lvar-result call block result-tns lvar)))))))

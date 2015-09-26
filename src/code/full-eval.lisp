@@ -36,23 +36,29 @@
                                            program-error)
   ())
 
-(defun arg-count-program-error (datum &rest arguments)
-  (declare (ignore datum))
-  (apply #'error 'arg-count-program-error arguments))
+;;; FIXME: This macro is not clearly better than plain destructuring-bind.
+;;;
+;;; First of all, it's ridiculous that the error message says
+;;;   "error while parsing arguments to PROGRAM-DESTRUCTURING-BIND".
+;;; The user doesn't care what the macro was that parsed the arguments
+;;; to the special operator. It should instead say
+;;;   "... while parsing arguments to special operator <foo>"
+;;;
+;;; Second, it is naive to think that existence of this macro suffices
+;;; to always signal an INTEPRETED-PROGRAM-ERROR and not just ERROR.
+;;; e.g. (LET ((X 1)) . JUNK) binds the &BODY variable to the non-list JUNK.
+;;; To fix the general problem, every use of DOLIST and other things
+;;; would have to be replaced by something like SB-PCL::DOLIST-CAREFULLY.
+;;; Similarly for ((&REST BINDINGS) &BODY BODY) wherein it's not even
+;;; obvious that BINDINGS is enforced by the macro to be a list. [lp#1469275]
 
 ;; OAOOM? (see destructuring-bind.lisp)
 (defmacro program-destructuring-bind (lambda-list arg-list &body body)
-  (let ((arg-list-name (gensym "ARG-LIST-")))
-    (multiple-value-bind (body local-decls)
-        (parse-defmacro lambda-list arg-list-name body nil
-                        'program-destructuring-bind
-                        :anonymousp t
-                        :doc-string-allowed nil
-                        :wrap-block nil
-                        :error-fun 'arg-count-program-error)
-      `(let ((,arg-list-name ,arg-list))
-         ,@local-decls
-         ,body))))
+  ;; (:EVAL) is a dummy context. We don't have enough information to
+  ;; show the operator name without using debugger internals to get the stack frame.
+  ;; It would be easier to make the name an argument to this macro.
+  `(sb!int:binding* ,(sb!c::expand-ds-bind lambda-list arg-list t nil '(:eval))
+     ,@body))
 
 (defun ip-error (format-control &rest format-arguments)
   (error 'interpreted-program-error
@@ -104,27 +110,30 @@
                    nil nil nil nil nil
                    (sb!c::lexenv-handled-conditions old-lexenv)
                    (sb!c::lexenv-disabled-package-locks old-lexenv)
-                   (sb!c::lexenv-policy old-lexenv)
-                   (sb!c::lexenv-user-data old-lexenv))))
+                   (sb!c::lexenv-policy old-lexenv) ; = (OR %POLICY *POLICY*)
+                   (sb!c::lexenv-user-data old-lexenv)
+                   old-lexenv)))
       (dolist (declaration declarations)
         (unless (consp declaration)
           (ip-error "malformed declaration specifier ~S in ~S"
                     declaration (cons 'declare declarations)))
         (case (car declaration)
           ((optimize)
+           (setf (sb!c::lexenv-%policy lexenv)
+                 (copy-structure (sb!c::lexenv-%policy lexenv)))
            (dolist (element (cdr declaration))
              (multiple-value-bind (quality value)
-                 (if (not (consp element))
+                 (if (not (consp element)) ; FIXME: OAOOM w/'proclaim'
                      (values element 3)
                      (program-destructuring-bind (quality value)
                          element
                        (values quality value)))
-               (if (sb!c::policy-quality-name-p quality)
-                   (push (cons quality value)
-                         (sb!c::lexenv-%policy lexenv))
-                   (warn "ignoring unknown optimization quality ~
-                                      ~S in ~S" quality
-                                      (cons 'declare declarations))))))
+               (sb!int:acond
+                ((sb!c::policy-quality-name-p quality)
+                 (sb!c::alter-policy (sb!c::lexenv-%policy lexenv)
+                                     sb!int:it value))
+                (t (warn "ignoring unknown optimization quality ~S in ~S"
+                         quality (cons 'declare declarations)))))))
           (muffle-conditions
            (setf (sb!c::lexenv-handled-conditions lexenv)
                  (sb!c::process-muffle-conditions-decl
@@ -177,7 +186,7 @@
               nil nil
               nil nil nil nil nil nil nil
               sb!c::*policy*
-              nil)))
+              nil nil)))
 
 ;;; Augment ENV with a special or lexical variable binding
 (declaim (inline push-var))
@@ -282,11 +291,15 @@
 ;;;
 ;;; Used only for implementing calls to interpreted functions.
 (defun parse-arguments (arguments lambda-list)
-  (multiple-value-bind (required optional rest-p rest keyword-p
-                        keyword allow-other-keys-p aux-p aux)
+  (multiple-value-bind (llks required optional rest keyword aux)
+      ;; FIXME: shouldn't this just pass ":silent t" ?
       (handler-bind ((style-warning #'muffle-warning))
         (sb!int:parse-lambda-list lambda-list))
     (let* ((original-arguments arguments)
+           (rest-p (not (null rest)))
+           (rest (car rest))
+           (keyword-p (sb!int:ll-kwds-keyp llks))
+           (allow-other-keys-p (sb!int:ll-kwds-allowp llks))
            (arguments-present (length arguments))
            (required-length (length required))
            (optional-length (length optional))
@@ -345,7 +358,7 @@
                 (push (cons (supplied-p-parameter keyword-spec)
                             (list 'quote (not (eq supplied *not-present*))))
                       let*-like-bindings))))))
-      (when aux-p
+      (when aux
         (do ()
             ((null aux))
           (let ((this-aux (pop aux)))
@@ -558,6 +571,7 @@
 (defun parse-lambda-headers (body &key doc-string-allowed)
   (loop with documentation = nil
         with declarations = nil
+        with lambda-list = :unspecified
         for form on body do
         (cond
           ((and doc-string-allowed (stringp (car form)))
@@ -567,31 +581,33 @@
                    (setf documentation (car form)))
                (return (values form documentation declarations))))
           ((and (consp (car form)) (eql (caar form) 'declare))
+           (when (eq lambda-list :unspecified)
+             (dolist (item (cdar form))
+               (when (and (consp item) (eq (car item) 'sb!c::lambda-list))
+                 (setq lambda-list (second item)))))
            (setf declarations (append declarations (cdar form))))
-          (t (return (values form documentation declarations))))
-        finally (return (values nil documentation declarations))))
+          (t (return (values form documentation declarations lambda-list))))
+        finally (return (values nil documentation declarations lambda-list))))
 
 ;;; Create an interpreted function from the lambda-form EXP evaluated
 ;;; in the environment ENV.
 (defun eval-lambda (exp env)
-  (case (car exp)
-    ((lambda)
-     (multiple-value-bind (body documentation declarations)
-         (parse-lambda-headers (cddr exp) :doc-string-allowed t)
-       (make-interpreted-function :lambda-list (second exp)
-                                  :env env :body body
+  (sb!int:binding* (((name rest)
+                     (case (car exp)
+                      ((lambda) (values nil (cdr exp)))
+                      ((sb!int:named-lambda) (values (second exp) (cddr exp)))))
+                    (lambda-list (car rest))
+                    ((forms documentation declarations debug-lambda-list)
+                     (parse-lambda-headers (cdr rest) :doc-string-allowed t)))
+       (make-interpreted-function :name name
+                                  :lambda-list lambda-list
+                                  :debug-lambda-list
+                                  (if (eq debug-lambda-list :unspecified)
+                                      lambda-list debug-lambda-list)
+                                  :env env :body forms
                                   :documentation documentation
                                   :source-location (sb!c::make-definition-source-location)
                                   :declarations declarations)))
-    ((sb!int:named-lambda)
-     (multiple-value-bind (body documentation declarations)
-         (parse-lambda-headers (cdddr exp) :doc-string-allowed t)
-       (make-interpreted-function :name (second exp)
-                                  :lambda-list (third exp)
-                                  :env env :body body
-                                  :documentation documentation
-                                  :source-location (sb!c::make-definition-source-location)
-                                  :declarations declarations)))))
 
 (defun eval-progn (body env)
   (let ((previous-exp nil))
@@ -719,53 +735,10 @@
 ;; definition form FUNCTION-DEF.
 (defun eval-local-macro-def (function-def env)
   (program-destructuring-bind (name lambda-list &body local-body) function-def
-    (multiple-value-bind (local-body documentation declarations)
-        (parse-lambda-headers local-body :doc-string-allowed t)
-      ;; HAS-ENVIRONMENT and HAS-WHOLE will be either NIL or the name
-      ;; of the variable. (Better names?)
-      (let (has-environment has-whole)
-        ;; Filter out &WHOLE and &ENVIRONMENT from the lambda-list, and
-        ;; do some syntax checking.
-        (when (eq (car lambda-list) '&whole)
-          (setf has-whole (second lambda-list))
-          (setf lambda-list (cddr lambda-list)))
-        (setf lambda-list
-              (loop with skip = 0
-                    for element in lambda-list
-                    if (cond
-                         ((/= skip 0)
-                          (decf skip)
-                          (setf has-environment element)
-                          nil)
-                         ((eq element '&environment)
-                          (if has-environment
-                              (ip-error "Repeated &ENVIRONMENT.")
-                              (setf skip 1))
-                          nil)
-                         ((eq element '&whole)
-                          (ip-error "&WHOLE may only appear first ~
-                                     in MACROLET lambda-list."))
-                         (t t))
-                    collect element))
-        (let ((outer-whole (gensym "WHOLE"))
-              (environment (or has-environment (gensym "ENVIRONMENT")))
-              (macro-name (gensym "NAME")))
-          (%eval `#'(lambda (,outer-whole ,environment)
-                      ,@(if documentation
-                            (list documentation)
-                            nil)
-                      (declare ,@(unless has-environment
-                                         `((ignore ,environment))))
-                      (program-destructuring-bind
-                          (,@(if has-whole
-                                 (list '&whole has-whole)
-                                 nil)
-                             ,macro-name ,@lambda-list)
-                          ,outer-whole
-                        (declare (ignore ,macro-name)
-                                 ,@declarations)
-                        (block ,name ,@local-body)))
-                 env))))))
+    (%eval (sb!int:make-macro-lambda nil ; the lambda is anonymous.
+                                     lambda-list local-body
+                                     'macrolet name)
+           env)))
 
 (defun eval-macrolet (body env)
   (program-destructuring-bind ((&rest local-functions) &body body) body

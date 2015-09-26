@@ -95,12 +95,6 @@
                         errorp))
 
 
-;;; This DEFVAR was originally in defs.lisp, now moved here.
-;;;
-;;; Possible values are NIL, EARLY, BRAID, or COMPLETE.
-(declaim (type (member nil early braid complete) **boot-state**))
-(defglobal **boot-state** nil)
-
 (/show "pcl/macros.lisp 187")
 
 (define-compiler-macro find-class (&whole form
@@ -120,12 +114,7 @@
                        (find-class-from-cell ',symbol ,cell nil))))))
       form))
 
-(declaim (ftype function class-wrapper))
-(declaim (inline class-classoid))
-(defun class-classoid (class)
-  (layout-classoid (class-wrapper class)))
-
-(declaim (ftype function %set-class-type-translation update-ctors))
+(declaim (ftype function update-ctors))
 (defun (setf find-class) (new-value name &optional errorp environment)
   (declare (ignore errorp environment))
   (cond ((legal-class-name-p name)
@@ -138,8 +127,7 @@
                     (setf (classoid-cell-pcl-class cell) new-value)
                     (when (eq **boot-state** 'complete)
                       (let ((classoid (class-classoid new-value)))
-                        (setf (find-classoid name) classoid)
-                        (%set-class-type-translation new-value classoid))))
+                        (setf (find-classoid name) classoid))))
                    (cell
                     (%clear-classoid name cell)))
              (when (or (eq **boot-state** 'complete)
@@ -162,6 +150,5 @@
 (defun get-setf-fun-name (name)
   `(setf ,name))
 
-(defsetf slot-value set-slot-value)
 
 (/show "finished with pcl/macros.lisp")

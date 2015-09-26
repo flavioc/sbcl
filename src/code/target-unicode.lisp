@@ -11,8 +11,9 @@
 
 (in-package "SB!UNICODE")
 
-(defparameter **special-numerics**
-  '#.(with-open-file (stream
+(declaim (type simple-vector **special-numerics**))
+(sb!impl::defglobal **special-numerics**
+  #.(with-open-file (stream
                      (merge-pathnames
                       (make-pathname
                        :directory
@@ -21,19 +22,23 @@
                       sb!xc:*compile-file-truename*)
                      :direction :input
                      :element-type 'character)
-        (read stream)))
+      (read stream)))
 
-(defparameter **block-ranges**
-  '#.(with-open-file (stream
-                     (merge-pathnames
-                      (make-pathname
-                       :directory
-                       '(:relative :up :up "output")
-                       :name "blocks" :type "lisp-expr")
-                      sb!xc:*compile-file-truename*)
-                     :direction :input
-                     :element-type 'character)
-        (read stream)))
+
+(declaim (type (simple-array (unsigned-byte 32) (*)) **block-ranges**))
+(sb!impl::defglobal **block-ranges**
+  #.(sb!int:!coerce-to-specialized
+     (with-open-file (stream
+                      (merge-pathnames
+                       (make-pathname
+                        :directory
+                        '(:relative :up :up "output")
+                        :name "blocks" :type "lisp-expr")
+                       sb!xc:*compile-file-truename*)
+                      :direction :input
+                      :element-type 'character)
+       (read stream))
+     '(unsigned-byte 32)))
 
 (macrolet ((unicode-property-init ()
              (let ((proplist-dump
@@ -103,44 +108,47 @@
   (unicode-property-init))
 
 ;;; Unicode property access
-(defun reverse-ucd-indices (strings)
-  (let ((hash (make-hash-table)))
-    (loop for string in strings
-          for index from 0
-          do (setf (gethash index hash) string))
-    hash))
-
 (defun ordered-ranges-member (item vector)
+  (declare (type simple-vector vector)
+           (type fixnum item)
+           (optimize speed))
   (labels ((recurse (start end)
+             (declare (type index start end))
              (when (< start end)
                (let* ((i (+ start (truncate (- end start) 2)))
                       (index (* 2 i))
                       (elt1 (svref vector index))
                       (elt2 (svref vector (1+ index))))
+                 (declare (type index i)
+                          (fixnum elt1 elt2))
                  (cond ((< item elt1)
                         (recurse start i))
                        ((> item elt2)
                         (recurse (+ 1 i) end))
                        (t
                         item))))))
-    (recurse 0 (/ (length vector) 2))))
+    (recurse 0 (truncate (length vector) 2))))
 
 ;; Returns which range `item` was found in or NIL
 ;; First range = 0, second range = 1 ...
 (defun ordered-ranges-position (item vector)
+  (declare (type (simple-array (unsigned-byte 32) (*)) vector)
+           (type fixnum item))
   (labels ((recurse (start end)
+             (declare (type index start end))
              (when (< start end)
                (let* ((i (+ start (truncate (- end start) 2)))
                       (index (* 2 i))
-                      (elt1 (svref vector index))
-                      (elt2 (svref vector (1+ index))))
+                      (elt1 (aref vector index))
+                      (elt2 (aref vector (1+ index))))
+                 (declare (type index i))
                  (cond ((< item elt1)
                         (recurse start i))
                        ((> item elt2)
                         (recurse (+ 1 i) end))
                        (t
                         i))))))
-    (recurse 0 (/ (length vector) 2))))
+    (recurse 0 (truncate (length vector) 2))))
 
 (defun proplist-p (character property)
   #!+sb-doc
@@ -151,42 +159,46 @@ with underscores replaced by dashes."
                          (gethash property **proplist-properties**)))
 
 ;; WARNING: These have to be manually kept in sync with the values in ucd.lisp
-(defparameter *general-categories*
-  (reverse-ucd-indices
-   '(:Lu :Ll :Lt :Lm :Lo :Cc :Cf :Co :Cs :Cn :Mc :Me :Mn :Nd
-     :Nl :No :Pc :Pd :Pe :Pf :Pi :Po :Ps :Sc :Sk :Sm :So :Zl
-     :Zp :Zs)))
+(declaim (type simple-vector *general-categories* *bidi-classes* *east-asian-widths*
+               *scripts* *line-break-classes* *blocks*))
+(sb!impl::defglobal *general-categories*
+  #(:Lu :Ll :Lt :Lm :Lo :Cc :Cf :Co :Cs :Cn :Mc :Me :Mn :Nd
+    :Nl :No :Pc :Pd :Pe :Pf :Pi :Po :Ps :Sc :Sk :Sm :So :Zl
+    :Zp :Zs))
 
-(defparameter *bidi-classes*
-  (reverse-ucd-indices
-   '(:BN :AL :AN :B :CS :EN :ES :ET :L :LRE :LRO :NSM :ON
-     :PDF :R :RLE :RLO :S :WS :LRI :RLI :FSI :PDI)))
+(sb!impl::defglobal *bidi-classes*
+  #(:BN :AL :AN :B :CS :EN :ES :ET :L :LRE :LRO :NSM :ON
+    :PDF :R :RLE :RLO :S :WS :LRI :RLI :FSI :PDI))
 
-(defparameter *east-asian-widths*
-  (reverse-ucd-indices '(:N :A :H :W :F :Na)))
+(sb!impl::defglobal *east-asian-widths*
+  #(:N :A :H :W :F :Na))
 
-(defparameter *scripts*
-  (reverse-ucd-indices
-   '(:Unknown :Common :Latin :Greek :Cyrillic :Armenian :Hebrew :Arabic :Syriac
-     :Thaana :Devanagari :Bengali :Gurmukhi :Gujarati :Oriya :Tamil :Telugu
-     :Kannada :Malayalam :Sinhala :Thai :Lao :Tibetan :Myanmar :Georgian :Hangul
-     :Ethiopic :Cherokee :Canadian-Aboriginal :Ogham :Runic :Khmer :Mongolian
-     :Hiragana :Katakana :Bopomofo :Han :Yi :Old-Italic :Gothic :Deseret
-     :Inherited :Tagalog :Hanunoo :Buhid :Tagbanwa :Limbu :Tai-Le :Linear-B
-     :Ugaritic :Shavian :Osmanya :Cypriot :Braille :Buginese :Coptic :New-Tai-Lue
-     :Glagolitic :Tifinagh :Syloti-Nagri :Old-Persian :Kharoshthi :Balinese
-     :Cuneiform :Phoenician :Phags-Pa :Nko :Sundanese :Lepcha :Ol-Chiki :Vai
-     :Saurashtra :Kayah-Li :Rejang :Lycian :Carian :Lydian :Cham :Tai-Tham
-     :Tai-Viet :Avestan :Egyptian-Hieroglyphs :Samaritan :Lisu :Bamum :Javanese
-     :Meetei-Mayek :Imperial-Aramaic :Old-South-Arabian :Inscriptional-Parthian
-     :Inscriptional-Pahlavi :Old-Turkic :Kaithi :Batak :Brahmi :Mandaic :Chakma
-     :Meroitic-Cursive :Meroitic-Hieroglyphs :Miao :Sharada :Sora-Sompeng
-     :Takri :Bassa-Vah :Mahajani :Pahawh-Hmong :Caucasian-Albanian :Manichaean
-     :Palmyrene :Duployan :Mende-Kikakui :Pau-Cin-Hau :Elbasan :Modi
-     :Psalter-Pahlavi :Grantha :Mro :Siddham :Khojki :Nabataean :Tirhuta
-     :Khudawadi :Old-North-Arabian :Warang-Citi :Linear-A :Old-Permic)))
+(sb!impl::defglobal *scripts*
+  #(:Unknown :Common :Latin :Greek :Cyrillic :Armenian :Hebrew :Arabic :Syriac
+    :Thaana :Devanagari :Bengali :Gurmukhi :Gujarati :Oriya :Tamil :Telugu
+    :Kannada :Malayalam :Sinhala :Thai :Lao :Tibetan :Myanmar :Georgian :Hangul
+    :Ethiopic :Cherokee :Canadian-Aboriginal :Ogham :Runic :Khmer :Mongolian
+    :Hiragana :Katakana :Bopomofo :Han :Yi :Old-Italic :Gothic :Deseret
+    :Inherited :Tagalog :Hanunoo :Buhid :Tagbanwa :Limbu :Tai-Le :Linear-B
+    :Ugaritic :Shavian :Osmanya :Cypriot :Braille :Buginese :Coptic :New-Tai-Lue
+    :Glagolitic :Tifinagh :Syloti-Nagri :Old-Persian :Kharoshthi :Balinese
+    :Cuneiform :Phoenician :Phags-Pa :Nko :Sundanese :Lepcha :Ol-Chiki :Vai
+    :Saurashtra :Kayah-Li :Rejang :Lycian :Carian :Lydian :Cham :Tai-Tham
+    :Tai-Viet :Avestan :Egyptian-Hieroglyphs :Samaritan :Lisu :Bamum :Javanese
+    :Meetei-Mayek :Imperial-Aramaic :Old-South-Arabian :Inscriptional-Parthian
+    :Inscriptional-Pahlavi :Old-Turkic :Kaithi :Batak :Brahmi :Mandaic :Chakma
+    :Meroitic-Cursive :Meroitic-Hieroglyphs :Miao :Sharada :Sora-Sompeng
+    :Takri :Bassa-Vah :Mahajani :Pahawh-Hmong :Caucasian-Albanian :Manichaean
+    :Palmyrene :Duployan :Mende-Kikakui :Pau-Cin-Hau :Elbasan :Modi
+    :Psalter-Pahlavi :Grantha :Mro :Siddham :Khojki :Nabataean :Tirhuta
+    :Khudawadi :Old-North-Arabian :Warang-Citi :Linear-A :Old-Permic))
 
-(defparameter *blocks*
+(sb!impl::defglobal *line-break-classes*
+    #(:XX :AI :AL :B2 :BA :BB :BK :CB :CJ :CL :CM :CP :CR :EX :GL
+      :HL :HY :ID :IN :IS :LF :NL :NS :NU :OP :PO :PR :QU :RI :SA
+      :SG :SP :SY :WJ :ZW))
+
+(sb!impl::defglobal *blocks*
   #(:Basic-Latin :Latin-1-Supplement :Latin-Extended-A :Latin-Extended-B
     :IPA-Extensions :Spacing-Modifier-Letters :Combining-Diacritical-Marks
     :Greek-and-Coptic :Cyrillic :Cyrillic-Supplement :Armenian :Hebrew :Arabic
@@ -254,16 +266,15 @@ with underscores replaced by dashes."
     :Tags :Variation-Selectors-Supplement :Supplementary-Private-Use-Area-A
     :Supplementary-Private-Use-Area-B))
 
-(defparameter *line-break-classes*
-  (reverse-ucd-indices
-   '(:XX :AI :AL :B2 :BA :BB :BK :CB :CJ :CL :CM :CP :CR :EX :GL
-     :HL :HY :ID :IN :IS :LF :NL :NS :NU :OP :PO :PR :QU :RI :SA
-     :SG :SP :SY :WJ :ZW)))
+(declaim (inline svref-or-null))
+(defun svref-or-null (vector index)
+  (and (< index (length vector))
+       (svref vector index)))
 
 (defun general-category (character)
   #!+sb-doc
   "Returns the general category of CHARACTER as it appears in UnicodeData.txt"
-  (gethash (sb!impl::ucd-general-category character) *general-categories*))
+  (svref-or-null *general-categories* (sb!impl::ucd-general-category character)))
 
 (defun bidi-class (character)
   #!+sb-doc
@@ -271,10 +282,11 @@ with underscores replaced by dashes."
   (if (and (eql (general-category character) :Cn)
            (default-ignorable-p character))
       :Bn
-      (gethash
-       (aref **character-misc-database** (+ 1 (misc-index character)))
-       *bidi-classes*)))
+      (svref-or-null
+       *bidi-classes*
+       (aref **character-misc-database** (1+ (misc-index character))))))
 
+(declaim (inline combining-class))
 (defun combining-class (character)
   #!+sb-doc
   "Returns the canonical combining class (CCC) of CHARACTER"
@@ -307,11 +319,11 @@ that have a digit value but no decimal digit value"
 (defun numeric-value (character)
   #!+sb-doc
   "Returns the numeric value of CHARACTER or NIL if there is no such value.
-
 Numeric value is the most general of the Unicode numeric properties.
 The only constraint on the numeric value is that it be a rational number."
-  (cdr (or (assoc (char-code character) **special-numerics**)
-           (cons nil (digit-value character)))))
+  (or (double-vector-binary-search (char-code character)
+                                   **special-numerics**)
+      (digit-value character)))
 
 (defun mirrored-p (character)
   #!+sb-doc
@@ -333,17 +345,17 @@ Otherwise, returns NIL."
   "Returns the East Asian Width property of CHARACTER as
 one of the keywords :N (Narrow), :A (Ambiguous), :H (Halfwidth),
 :W (Wide), :F (Fullwidth), or :NA (Not applicable)"
-  (gethash (ldb (byte 3 0)
-                (aref **character-misc-database**
-                      (+ 5 (misc-index character))))
-           *east-asian-widths*))
+  (svref-or-null *east-asian-widths*
+                 (ldb (byte 3 0)
+                      (aref **character-misc-database**
+                            (+ 5 (misc-index character))))))
 
 (defun script (character)
   #!+sb-doc
   "Returns the Script property of CHARACTER as a keyword.
 If CHARACTER does not have a known script, returns :UNKNOWN"
-  (gethash (aref **character-misc-database** (+ 6 (misc-index character)))
-           *scripts*))
+  (svref-or-null *scripts*
+                 (aref **character-misc-database** (+ 6 (misc-index character)))))
 
 (defun char-block (character)
   #!+sb-doc
@@ -406,8 +418,8 @@ Ideographic (:ID) class instead of Alphabetic (:AL)."
   (when (and resolve (listp character)) (setf character (car character)))
   (when (and resolve (not character)) (return-from line-break-class :nil))
   (let ((raw-class
-         (gethash (aref **character-misc-database** (+ 7 (misc-index character)))
-           *line-break-classes*))
+         (svref-or-null *line-break-classes*
+                        (aref **character-misc-database** (+ 7 (misc-index character)))))
         (syllable-type (hangul-syllable-type character)))
     (when syllable-type
       (setf raw-class
@@ -509,6 +521,7 @@ disappears when accents are placed on top of it. and NIL otherwise"
 
 
 ;;; Implements UAX#15: Normalization Forms
+(declaim (inline char-decomposition-info))
 (defun char-decomposition-info (char)
   (let ((value (aref **character-misc-database**
                      (+ 4 (misc-index char)))))
@@ -562,38 +575,43 @@ disappears when accents are placed on top of it. and NIL otherwise"
             (char-decomposition char info callback))
         (funcall callback char))))
 
-(defun decompose-string (string &optional (kind :canonical))
-  (let ((compatibility (ecase kind
-                         (:compatibility t)
-                         (:canonical nil))))
-    (let (chars
-          (length 0)
-          previous-char
-          (previous-combining-class 0))
-      (dx-flet ((callback (char)
-                  (let ((combining-class (combining-class char)))
-                    (incf length)
-                    (cond ((< 0 combining-class previous-combining-class)
-                           ;; Ensure it's sorted
-                           (loop for cons on chars
-                                 for next-char = (cadr cons)
-                                 when (or (not next-char)
-                                          (<= 0 (combining-class next-char) combining-class))
-                                 do (setf (cdr cons)
-                                          (cons char (cdr cons)))
-                                    (return)))
-                          (t
-                           (push char chars)
-                           (setf previous-char char
-                                 previous-combining-class combining-class))))))
-        (loop for char across string
-              do
-              (decompose-char char compatibility #'callback))
-        (let ((result (make-string length)))
-          (loop for char in (nreverse chars)
-                for i from 0
-                do (setf (schar result i) char))
-          result)))))
+(defun decompose-string (string compatibility filter)
+  (let (chars
+        (length 0)
+        (previous-combining-class 0))
+    (declare (type index length))
+    (dx-flet ((callback (char)
+                        (let ((combining-class (combining-class char)))
+                          (incf length)
+                          (cond ((< 0 combining-class previous-combining-class)
+                                 ;; Ensure it's sorted
+                                 (loop for cons on chars
+                                       for next-char = (cadr cons)
+                                       when (or (not next-char)
+                                                (<= 0 (combining-class next-char) combining-class))
+                                       do (setf (cdr cons)
+                                                (cons char (cdr cons)))
+                                          (return)))
+                                (t
+                                 (push char chars)
+                                 (setf previous-combining-class combining-class))))))
+      (sb!kernel:with-array-data ((string string) (start) (end))
+        (declare (ignore start))
+        (let ((calback (if filter
+                           (let ((filter (sb!kernel:%coerce-callable-to-fun filter)))
+                             (lambda (char)
+                               (when (funcall filter char)
+                                 (callback char))))
+                           #'callback)))
+          (loop for i below end
+                for char = (schar string i)
+                do
+                (decompose-char char compatibility calback))))
+      (let ((result (make-string length)))
+        (loop for char in chars
+              for i from (1- length) downto 0
+              do (setf (schar result i) char))
+        result))))
 
 (defun composition-hangul-syllable-type (cp)
   (cond
@@ -716,11 +734,16 @@ disappears when accents are placed on top of it. and NIL otherwise"
         string
         (lstring result))))
 
-(defun normalize-string (string &optional (form :nfd))
+(defun normalize-string (string &optional (form :nfd)
+                                          filter)
   #!+sb-doc
   "Normalize STRING to the Unicode normalization form form.
-   Acceptable values for form are :NFD, :NFC, :NFKD, and :NFKC"
+Acceptable values for form are :NFD, :NFC, :NFKD, and :NFKC.
+If FILTER is a function it is called on each decomposed character and
+only characters for which it returns T are collected."
   (declare (type (member :nfd :nfkd :nfc :nfkc) form))
+  #!-sb-unicode
+  (declare (ignore filter))
   #!-sb-unicode
   (etypecase string
     ((array nil (*)) string)
@@ -734,13 +757,13 @@ disappears when accents are placed on top of it. and NIL otherwise"
     ((array character (*))
      (ecase form
        ((:nfc)
-        (canonically-compose (decompose-string string)))
+        (canonically-compose (decompose-string string nil filter)))
        ((:nfd)
-        (decompose-string string))
+        (decompose-string string nil filter))
        ((:nfkc)
-        (canonically-compose (decompose-string string :compatibility)))
+        (canonically-compose (decompose-string string t filter)))
        ((:nfkd)
-        (decompose-string string :compatibility))))
+        (decompose-string string t filter))))
     ((array nil (*)) string)))
 
 (defun normalized-p (string &optional (form :nfd))
@@ -1486,7 +1509,7 @@ it defaults to 80 characters"
 
 
 ;;; Collation
-(defparameter **maximum-variable-primary-element**
+(defconstant +maximum-variable-primary-element+
   #.(with-open-file (stream
                      (merge-pathnames
                       (make-pathname
@@ -1506,8 +1529,9 @@ it defaults to 80 characters"
               (ldb (byte 11 5) value)
               (ldb (byte 5 0) value))))
 
+(declaim (inline variable-p))
 (defun variable-p (x)
-  (<= 1 x **maximum-variable-primary-element**))
+  (<= 1 x +maximum-variable-primary-element+))
 
 (defun collation-key (string start end)
   (let (char1

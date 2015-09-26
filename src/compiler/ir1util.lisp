@@ -64,10 +64,7 @@
 ;;; Return a list of all the nodes which use LVAR.
 (declaim (ftype (sfunction (lvar) list) find-uses))
 (defun find-uses (lvar)
-  (let ((uses (lvar-uses lvar)))
-    (if (listp uses)
-        uses
-        (list uses))))
+  (ensure-list (lvar-uses lvar)))
 
 (declaim (ftype (sfunction (lvar) lvar) principal-lvar))
 (defun principal-lvar (lvar)
@@ -531,7 +528,7 @@
                  (lvar-good-for-dx-p (trivial-lambda-var-ref-lvar use) dx component))))))
 
 (defun lvar-good-for-dx-p (lvar dx &optional component)
-  (let ((uses (lvar-uses lvar)))
+  (let ((uses (lvar-uses lvar))) ; TODO use ENSURE-LIST? or is it too slow?
     (if (listp uses)
         (when uses
           (every (lambda (use)
@@ -662,7 +659,7 @@
                     (handle-nested-dynamic-extent-lvars
                      dx other recheck-component)))))))
       (cons (cons dx lvar)
-            (if (listp uses)
+            (if (listp uses) ; TODO use ENSURE-LIST? or is it too slow?
                 (loop for use in uses
                       when (use-good-for-dx-p use dx recheck-component)
                       nconc (recurse use))
@@ -925,7 +922,8 @@
      lambda
      cleanup handled-conditions disabled-package-locks
      policy
-     user-data)))
+     user-data
+     default)))
 
 ;;; Makes a LEXENV, suitable for using in a MACROLET introduced
 ;;; macroexpander
@@ -960,7 +958,8 @@
      (lexenv-handled-conditions lexenv)
      (lexenv-disabled-package-locks lexenv)
      (lexenv-policy lexenv)
-     (lexenv-user-data lexenv))))
+     (lexenv-user-data lexenv)
+     lexenv)))
 
 ;;;; flow/DFO/component hackery
 
@@ -1387,7 +1386,7 @@
       ;; have one.
       (let ((policy (lexenv-%policy *lexenv*)))
         (dolist (functional functionals)
-          (when (equal policy (lexenv-%policy (functional-lexenv functional)))
+          (when (policy= policy (lexenv-%policy (functional-lexenv functional)))
             (return functional)))))))
 
 ;;; Do stuff to delete the semantic attachments of a REF node. When
@@ -1879,17 +1878,16 @@ is :ANY, the function name is not checked."
   (declare (type lvar lvar)
            (type (or symbol list) fun)
            (type index num-args))
-  (let ((fun (if (listp fun) fun (list fun))))
-    (let ((inside (lvar-uses lvar)))
-      (unless (combination-p inside)
+  (let ((inside (lvar-uses lvar)))
+    (unless (combination-p inside)
+      (give-up-ir1-transform))
+    (let ((inside-fun (combination-fun inside)))
+      (unless (member (lvar-fun-name inside-fun) (ensure-list fun))
         (give-up-ir1-transform))
-      (let ((inside-fun (combination-fun inside)))
-        (unless (member (lvar-fun-name inside-fun) fun)
+      (let ((inside-args (combination-args inside)))
+        (unless (= (length inside-args) num-args)
           (give-up-ir1-transform))
-        (let ((inside-args (combination-args inside)))
-          (unless (= (length inside-args) num-args)
-            (give-up-ir1-transform))
-          (values (lvar-fun-name inside-fun) inside-args))))))
+        (values (lvar-fun-name inside-fun) inside-args)))))
 
 (defun flush-combination (combination)
   (declare (type combination combination))
@@ -2192,7 +2190,7 @@ is :ANY, the function name is not checked."
 
 
 (defun call-full-like-p (call)
-  (declare (type combination call))
+  (declare (type basic-combination call))
   (let ((kind (basic-combination-kind call)))
     (or (eq kind :full)
         (and (eq kind :known)
@@ -2233,8 +2231,9 @@ is :ANY, the function name is not checked."
        `(progn
           (defun ,careful (specifier)
             (handler-case (,basic specifier)
-              (sb!kernel::arg-count-error (condition)
-                (values nil (list (format nil "~A" condition))))
+              ((or sb!kernel::arg-count-error
+                type-error) (condition)
+                (values nil (list (princ-to-string condition))))
               (simple-error (condition)
                 (values nil (list* (simple-condition-format-control condition)
                                    (simple-condition-format-arguments condition))))))

@@ -32,15 +32,15 @@
 (defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
 
-;;; Make a passing location TN for a local call return PC.  If
-;;; standard is true, then use the standard (full call) location,
-;;; otherwise use any legal location.  Even in the non-standard case,
-;;; this may be restricted by a desire to use a subroutine call
-;;; instruction.
+;;; Always wire the return PC location to the stack in its standard
+;;; location.
 (defun make-return-pc-passing-location (standard)
   (declare (ignore standard))
   (make-wired-tn *backend-t-primitive-type* control-stack-sc-number
                  lra-save-offset))
+
+(defconstant return-pc-passing-offset
+  (make-sc-offset control-stack-sc-number lra-save-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in.
@@ -53,6 +53,9 @@
   (declare (ignore standard))
   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
                  ocfp-save-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc-offset control-stack-sc-number ocfp-save-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -965,11 +968,11 @@
                   (when step-instrumenting
                     (assemble ()
                       ;; Get the symbol-value of SB!IMPL::*STEPPING*
-                      ;; KLUDGE: ... into LIP.  Either it's NIL or it
+                      ;; KLUDGE: ... into LIP.  Either it's zero or it
                       ;; isn't, and even taking a stray interrupt and
                       ;; GC can't screw that up.
                       (load-symbol-value lip sb!impl::*stepping*)
-                      (inst cmp lip null-tn)
+                      (inst cmp lip 0)
                       ;; If it's not null, trap.
                       (inst b :eq step-done-label)
                       ;; CONTEXT-PC will be pointing here when the
@@ -1209,8 +1212,8 @@
   (:vop-var vop)
   (:generator 3
     (load-symbol-value stepping sb!impl::*stepping*)
-    ;; If it's not NIL, trap.
-    (inst cmp stepping null-tn)
+    ;; If it's not zero, trap.
+    (inst cmp stepping 0)
     (inst b :eq DONE)
     ;; CONTEXT-PC will be pointing here when the interrupt is handled,
     ;; not after the BREAK.

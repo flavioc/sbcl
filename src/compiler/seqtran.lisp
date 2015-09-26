@@ -158,7 +158,7 @@
                                       result-type)))
                    (if (array-type-p result-ctype)
                        (let ((dims (array-type-dimensions result-ctype)))
-                         (unless (and (listp dims) (= (length dims) 1))
+                         (unless (singleton-p dims)
                            (give-up-ir1-transform "invalid sequence type"))
                          (let ((dim (first dims)))
                            (if (eq dim '*)
@@ -244,29 +244,18 @@
 
 ;;; Try to compile %MAP efficiently when we can determine sequence
 ;;; argument types at compile time.
-;;;
-;;; Note: This transform was written to allow open coding of
-;;; quantifiers by expressing them in terms of (MAP NIL ..). For
-;;; non-NIL values of RESULT-TYPE, it's still useful, but not
-;;; necessarily as efficient as possible. In particular, it will be
-;;; inefficient when RESULT-TYPE is a SIMPLE-ARRAY with specialized
-;;; numeric element types. It should be straightforward to make it
-;;; handle that case more efficiently, but it's left as an exercise to
-;;; the reader, because the code is complicated enough already and I
-;;; don't happen to need that functionality right now. -- WHN 20000410
 (deftransform %map ((result-type fun seq &rest seqs) * *
                     :node node :policy (>= speed space))
   "open code"
   (unless (constant-lvar-p result-type)
     (give-up-ir1-transform "RESULT-TYPE argument not constant"))
-  (labels ( ;; 1-valued SUBTYPEP, fails unless second value of SUBTYPEP is true
-           (fn-1subtypep (fn x y)
-             (multiple-value-bind (subtype-p valid-p) (funcall fn x y)
-               (if valid-p
-                   subtype-p
-                   (give-up-ir1-transform
-                    "can't analyze sequence type relationship"))))
-           (1subtypep (x y) (fn-1subtypep #'sb!xc:subtypep x y)))
+  (flet ( ;; 1-valued SUBTYPEP, fails unless second value of SUBTYPEP is true
+         (1subtypep (x y)
+           (multiple-value-bind (subtype-p valid-p) (sb!xc:subtypep x y)
+             (if valid-p
+                 subtype-p
+                 (give-up-ir1-transform
+                  "can't analyze sequence type relationship")))))
     (let* ((result-type-value (lvar-value result-type))
            (result-supertype (cond ((null result-type-value) 'null)
                                    ((1subtypep result-type-value 'vector)
@@ -276,22 +265,27 @@
                                    (t
                                     (give-up-ir1-transform
                                      "result type unsuitable")))))
-      (cond ((and result-type-value (null seqs))
+      (cond ((and (eq result-supertype 'list) (null seqs))
              ;; The consing arity-1 cases can be implemented
              ;; reasonably efficiently as function calls, and the cost
              ;; of consing should be significantly larger than
              ;; function call overhead, so we always compile these
              ;; cases as full calls regardless of speed-versus-space
              ;; optimization policy.
-             (cond ((subtypep result-type-value 'list)
-                    '(%map-to-list-arity-1 fun seq))
-                   ( ;; (This one can be inefficient due to COERCE, but
-                    ;; the current open-coded implementation has the
-                    ;; same problem.)
-                    (subtypep result-type-value 'vector)
-                    `(coerce (%map-to-simple-vector-arity-1 fun seq)
-                             ',result-type-value))
-                   (t (bug "impossible (?) sequence type"))))
+             '(%map-to-list-arity-1 fun seq))
+            ;; (We use the same idiom, of returning a LAMBDA from
+            ;; DEFTRANSFORM, as is used in the DEFTRANSFORMs for
+            ;; FUNCALL and ALIEN-FUNCALL, and for the same
+            ;; reason: we need to get the runtime values of each
+            ;; of the &REST vars.)
+            ((eq result-supertype 'vector)
+             (let* ((all-seqs (cons seq seqs))
+                    (seq-args (make-gensym-list (length all-seqs))))
+               `(lambda (result-type fun ,@seq-args)
+                  (map-into (make-sequence result-type
+                                           (min ,@(loop for arg in seq-args
+                                                        collect `(length ,arg))))
+                            fun ,@seq-args))))
             (t
              (let* ((all-seqs (cons seq seqs))
                     (seq-args (make-gensym-list (length all-seqs))))
@@ -299,71 +293,77 @@
                    (ecase result-supertype
                      (null (values nil nil))
                      (list (values `(push funcall-result acc)
-                                   `(nreverse acc)))
-                     (vector (values `(push funcall-result acc)
-                                     `(coerce (nreverse acc)
-                                              ',result-type-value))))
-                 ;; (We use the same idiom, of returning a LAMBDA from
-                 ;; DEFTRANSFORM, as is used in the DEFTRANSFORMs for
-                 ;; FUNCALL and ALIEN-FUNCALL, and for the same
-                 ;; reason: we need to get the runtime values of each
-                 ;; of the &REST vars.)
-                 (block nil
-                   (let ((gave-up
-                           (catch 'give-up-ir1-transform
-                             (return
-                               `(lambda (result-type fun ,@seq-args)
-                                  (declare (ignore result-type))
-                                  (let ((fun (%coerce-callable-to-fun fun))
-                                        (acc nil))
-                                    (declare (type list acc))
-                                    (declare (ignorable acc))
-                                    ,(build-sequence-iterator
-                                      all-seqs seq-args
-                                      :result result
-                                      :body push-dacc
-                                      :fast (policy node (> speed space)))))))))
-                     (if (and (null result-type-value) (null seqs))
-                         '(%map-for-effect-arity-1 fun seq)
-                         (throw 'give-up-ir1-transform gave-up)))))))))))
+                                   `(nreverse acc))))
+                 (catch-give-up-ir1-transform
+                     (`(lambda (result-type fun ,@seq-args)
+                         (declare (ignore result-type))
+                         (let ((fun (%coerce-callable-to-fun fun))
+                               (acc nil))
+                           (declare (type list acc))
+                           (declare (ignorable acc))
+                           ,(build-sequence-iterator
+                             all-seqs seq-args
+                             :result result
+                             :body push-dacc
+                             :fast (policy node (> speed space))))))
+                   (if (and (null result-type-value) (null seqs))
+                       '(%map-for-effect-arity-1 fun seq)
+                       (%give-up))))))))))
 
 ;;; MAP-INTO
 (deftransform map-into ((result fun &rest seqs)
                         (vector * &rest *)
                         * :node node)
   "open code"
-  (let ((seqs-names (mapcar (lambda (x)
-                              (declare (ignore x))
-                              (gensym))
-                            seqs)))
-    `(lambda (result fun ,@seqs-names)
-       ,(if (and (policy node (> speed space))
-                 (not (csubtypep (lvar-type result)
-                                 (specifier-type '(simple-array * 1)))))
-            (let ((data  (gensym "DATA"))
-                  (start (gensym "START"))
-                  (end   (gensym "END")))
-              `(with-array-data ((,data result)
-                                 (,start)
-                                 (,end))
-                 (declare (ignore ,end))
-                 ,(build-sequence-iterator
-                   seqs seqs-names
-                   :result '(when (array-has-fill-pointer-p result)
-                             (setf (fill-pointer result) index))
-                   :into 'result
-                   :body `(locally (declare (optimize (insert-array-bounds-checks 0)))
-                           (setf (aref ,data (truly-the index (+ index ,start)))
-                                 funcall-result))
-                   :fast t)))
-            (build-sequence-iterator
-             seqs seqs-names
-             :result '(when (array-has-fill-pointer-p result)
-                       (setf (fill-pointer result) index))
-             :into 'result
-             :body '(locally (declare (optimize (insert-array-bounds-checks 0)))
-                     (setf (aref result index) funcall-result))))
-       result)))
+  (let* ((seqs-names (make-gensym-list (length seqs)))
+         (result-type (lvar-type result))
+         (non-complex-vector-type-p (csubtypep result-type
+                                               (specifier-type '(simple-array * 1)))))
+    (catch-give-up-ir1-transform
+        (`(lambda (result fun ,@seqs-names)
+            ,(if (and (policy node (> speed space))
+                      (not non-complex-vector-type-p))
+                 (let ((data  (gensym "DATA"))
+                       (start (gensym "START"))
+                       (end   (gensym "END")))
+                   `(with-array-data ((,data result)
+                                      (,start)
+                                      (,end))
+                      (declare (ignore ,end))
+                      ,(build-sequence-iterator
+                        seqs seqs-names
+                        :result '(when (array-has-fill-pointer-p result)
+                                  (setf (fill-pointer result) index))
+                        :into 'result
+                        :body `(locally (declare (optimize (insert-array-bounds-checks 0)))
+                                 (setf (aref ,data (truly-the index (+ index ,start)))
+                                       funcall-result))
+                        :fast t)))
+                 (build-sequence-iterator
+                  seqs seqs-names
+                  :result '(when (array-has-fill-pointer-p result)
+                            (setf (fill-pointer result) index))
+                  :into 'result
+                  :body '(locally (declare (optimize (insert-array-bounds-checks 0)))
+                          (setf (aref result index) funcall-result))))
+            result))
+      (cond #-sb-xc-host
+            ;; %%vector-map-into-funs%% is not defined in xc
+            ;; if something needs to be faster in the compiler, it
+            ;; should declare the input sequences instead.
+            ((and non-complex-vector-type-p
+                  (array-type-p result-type)
+                  (not (eq (array-type-specialized-element-type result-type)
+                           *wild-type*)))
+             (let ((saetp (find-saetp-by-ctype (array-type-specialized-element-type result-type))))
+               (unless saetp
+                 (give-up-ir1-transform "Uknown upgraded array element type of the result"))
+               (let ((mapper (%fun-name (svref sb!impl::%%vector-map-into-funs%%
+                                               (sb!vm:saetp-typecode saetp)))))
+                 `(progn (,mapper result 0 (length result) (%coerce-callable-to-fun fun) seqs)
+                         result))))
+            (t
+             (%give-up))))))
 
 
 ;;; FIXME: once the confusion over doing transforms with known-complex
@@ -631,9 +631,9 @@
                   (kind (cond ((sb!vm:saetp-fixnum-p saetp) :tagged)
                               ((member element-type '(character base-char)) :char)
                               ((eq element-type 'single-float) :single-float)
-                              #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                              #!+64-bit
                               ((eq element-type 'double-float) :double-float)
-                              #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                              #!+64-bit
                               ((equal element-type '(complex single-float))
                                :complex-single-float)
                               (t
@@ -658,11 +658,11 @@
                                          tmp)
                                         (:single-float
                                          (single-float-bits tmp))
-                                        #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                        #!+64-bit
                                         (:double-float
                                          (logior (ash (double-float-high-bits tmp) 32)
                                                  (double-float-low-bits tmp)))
-                                        #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                        #!+64-bit
                                         (:complex-single-float
                                          (logior (ash (single-float-bits (imagpart tmp)) 32)
                                                  (ldb (byte 32 0)
@@ -685,11 +685,11 @@
                                                     `item)
                                                    (:single-float
                                                     `(single-float-bits item))
-                                                   #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                                   #!+64-bit
                                                    (:double-float
                                                     `(logior (ash (double-float-high-bits item) 32)
                                                              (double-float-low-bits item)))
-                                                   #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+                                                   #!+64-bit
                                                    (:complex-single-float
                                                     `(logior (ash (single-float-bits (imagpart item)) 32)
                                                              (ldb (byte 32 0)
@@ -1042,23 +1042,20 @@
                    (%vector-raw-bits src (1- i))))
            (values))))))
 
-#.(loop for i = 1 then (* i 2)
-        collect `(deftransform ,(intern (format nil "UB~D-BASH-COPY" i)
-                                        "SB!KERNEL")
-                                                        ((src src-offset
-                                                          dst dst-offset
-                                                          length)
-                                                        ((simple-unboxed-array (*))
-                                                         (constant-arg index)
-                                                         (simple-unboxed-array (*))
-                                                         (constant-arg index)
-                                                         index)
-                                                        *)
-                  (frob-bash-transform src src-offset
-                                       dst dst-offset length
-                                       ,(truncate sb!vm:n-word-bits i))) into forms
-        until (= i sb!vm:n-word-bits)
-        finally (return `(progn ,@forms)))
+#.
+(let ((arglist '((src src-offset dst dst-offset length)
+                 ((simple-unboxed-array (*)) (constant-arg index)
+                  (simple-unboxed-array (*)) (constant-arg index)
+                  index)
+                 *)))
+  (loop for i = 1 then (* i 2)
+     for name = (intern (format nil "UB~D-BASH-COPY" i) "SB!KERNEL")
+     collect `(deftransform ,name ,arglist
+                (frob-bash-transform src src-offset
+                                     dst dst-offset length
+                                     ,(truncate sb!vm:n-word-bits i))) into forms
+     until (= i sb!vm:n-word-bits)
+     finally (return `(progn ,@forms))))
 
 ;;; We expand copy loops inline in SUBSEQ and COPY-SEQ if we're copying
 ;;; arrays with elements of size >= the word size.  We do this because
@@ -1388,54 +1385,53 @@
                        while (and (stringp value)
                                     (< (length value) *concatenate-open-code-limit*))
                        sum (length value))))
-          `(apply
-            (lambda ,vars
-              (declare (ignorable ,@vars))
-              (declare (optimize (insert-array-bounds-checks 0)))
-              (let* ((.length. (+ ,@lengths))
-                     (.pos. ,non-constant-start)
-                     (.string. (make-string .length. :element-type ',element-type)))
-                (declare (type index .length. .pos.)
-                         #-sb-xc-host (muffle-conditions compiler-note)
-                         (ignorable .pos.))
-                ,@(loop with constants = -1
-                        for first = t then nil
-                        for value in lvar-values
-                        for var in vars
-                        collect
-                        (cond ((and (stringp value)
-                                    (< (length value) *concatenate-open-code-limit*))
-                               ;; Fold the array reads for constant arguments
-                               `(progn
-                                  ,@(loop for c across value
-                                          for i from 0
-                                          collect
-                                          ;; Without truly-the we get massive numbers
-                                          ;; of pointless error traps.
-                                          `(setf (aref .string.
-                                                       (truly-the index ,(if constants
-                                                                             (incf constants)
-                                                                             `(+ .pos. ,i))))
-                                                 ,c))
-                                  ,(unless constants
-                                     `(incf (truly-the index .pos.) ,(length value)))))
-                              (t
-                               (prog1
-                                   `(sb!impl::string-dispatch
-                                        (#!+sb-unicode
-                                         (simple-array character (*))
-                                         (simple-array base-char (*))
-                                         t)
-                                        ,var
-                                      (replace .string. ,var
-                                               ,@(cond ((not constants)
-                                                        '(:start1 .pos.))
-                                                       ((plusp non-constant-start)
-                                                        `(:start1 ,non-constant-start))))
-                                      (incf (truly-the index .pos.) (length ,var)))
-                                 (setf constants nil)))))
-                .string.))
-            lvars)))))
+          `(lambda (.dummy. ,@vars)
+             (declare (ignore .dummy.)
+                      (ignorable ,@vars))
+             (declare (optimize (insert-array-bounds-checks 0)))
+             (let* ((.length. (+ ,@lengths))
+                    (.pos. ,non-constant-start)
+                    (.string. (make-string .length. :element-type ',element-type)))
+               (declare (type index .length. .pos.)
+                        #-sb-xc-host (muffle-conditions compiler-note)
+                        (ignorable .pos.))
+               ,@(loop with constants = -1
+                       for first = t then nil
+                       for value in lvar-values
+                       for var in vars
+                       collect
+                       (cond ((and (stringp value)
+                                   (< (length value) *concatenate-open-code-limit*))
+                              ;; Fold the array reads for constant arguments
+                              `(progn
+                                 ,@(loop for c across value
+                                         for i from 0
+                                         collect
+                                         ;; Without truly-the we get massive numbers
+                                         ;; of pointless error traps.
+                                         `(setf (aref .string.
+                                                      (truly-the index ,(if constants
+                                                                            (incf constants)
+                                                                            `(+ .pos. ,i))))
+                                                ,c))
+                                 ,(unless constants
+                                    `(incf (truly-the index .pos.) ,(length value)))))
+                             (t
+                              (prog1
+                                  `(sb!impl::string-dispatch
+                                       (#!+sb-unicode
+                                        (simple-array character (*))
+                                        (simple-array base-char (*))
+                                        t)
+                                       ,var
+                                     (replace .string. ,var
+                                              ,@(cond ((not constants)
+                                                       '(:start1 .pos.))
+                                                      ((plusp non-constant-start)
+                                                       `(:start1 ,non-constant-start))))
+                                     (incf (truly-the index .pos.) (length ,var)))
+                                (setf constants nil)))))
+               .string.))))))
 
 ;;;; CONS accessor DERIVE-TYPE optimizers
 

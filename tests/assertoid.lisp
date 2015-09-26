@@ -16,7 +16,8 @@
   (:use "CL")
   (:export "GRAB-CONDITION" "ASSERT-ERROR"
            "HAS-ERROR?" "IS" "ASSERTOID"
-           "ASSERT-SIGNAL" "ASSERT-NO-SIGNAL"))
+           "ASSERT-SIGNAL" "ASSERT-NO-SIGNAL"
+           "EQUAL-MOD-GENSYMS"))
 
 (cl:in-package "ASSERTOID")
 
@@ -30,21 +31,43 @@
 (defmacro assert-error (form &optional (error-subtype-spec 'error))
   `(assert (typep (nth-value 1 (ignore-errors ,form)) ',error-subtype-spec)))
 
-(defmacro assert-signal (form &optional (signal-type 'condition))
-  (let ((signal (gensym)))
-    `(let (,signal)
-       (handler-bind ((,signal-type (lambda (c)
-                                      (setf ,signal c))))
-         ,form)
-       (assert ,signal))))
+(defun %assert-signal (thunk condition-type
+                       expected-min-count expected-max-count)
+  (declare (ignore condition-type))
+  (let ((count 0))
+    (prog1
+        (funcall thunk (lambda (condition)
+                         (incf count)
+                         (when (typep condition 'warning)
+                           (muffle-warning condition))))
+      (assert (<= expected-min-count count expected-max-count)))))
 
-(defmacro assert-no-signal (form &optional (signal-type 'condition))
-  (let ((signal (gensym)))
-    `(let (,signal)
-       (handler-bind ((,signal-type (lambda (c)
-                                      (setf ,signal c))))
-         ,form)
-       (assert (not ,signal)))))
+(defmacro assert-signal (form &optional
+                              (condition-type 'condition)
+                              (expected-min-count 1)
+                              (expected-max-count expected-min-count))
+  (let ((handle (gensym)))
+    `(%assert-signal
+      (lambda (,handle)
+        (handler-bind ((,condition-type ,handle)) ,form))
+      ',condition-type ,expected-min-count ,expected-max-count)))
+
+(defun %assert-no-signal (thunk condition-type)
+  (declare (ignore condition-type))
+  (let ((signaled-condition))
+    (prog1
+        (funcall thunk (lambda (condition)
+                         (setf signaled-condition condition)
+                         (when (typep condition 'warning)
+                           (muffle-warning condition))))
+      (assert (not signaled-condition)))))
+
+(defmacro assert-no-signal (form &optional (condition-type 'condition))
+  (let ((handle (gensym)))
+    `(%assert-no-signal
+      (lambda (,handle)
+        (handler-bind ((,condition-type ,handle)) ,form))
+      ',condition-type)))
 
 ;;; EXPR is an expression to evaluate (both with EVAL and with
 ;;; COMPILE/FUNCALL). EXTRA-OPTIMIZATIONS is a list of lists of
@@ -145,3 +168,26 @@
                     expected-value real-value ',form))))
       `(unless ,form
          (error "~S evaluated to NIL" ',form))))
+
+;; Return T if two sexprs are EQUAL, considering uninterned symbols
+;; in expression A as EQ to one in B provided that there exists a
+;; mapping that makes the forms EQUAL.
+;; This is helpful when testing complicated macroexpanders.
+;; Note that this is much simpler than unification,
+;; because symbols can only be replaced by other symbols.
+(defun equal-mod-gensyms (a b &optional (pred #'equal))
+  (let ((subst-table (make-hash-table :test 'eq)))
+    (labels ((recurse (a b)
+               (cond ((and (consp a) (consp b))
+                      (and (recurse (car a) (car b))
+                           (recurse (cdr a) (cdr b))))
+                     ((and (symbolp a) (symbolp b))
+                      (multiple-value-bind (replacement found)
+                          (gethash a subst-table a)
+                        (or (eq replacement b)
+                            (and (not found)
+                                 (not (symbol-package a))
+                                 (setf (gethash a subst-table) b)))))
+                     (t ; strings, numbers
+                      (funcall pred a b)))))
+      (recurse a b))))

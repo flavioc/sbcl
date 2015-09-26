@@ -1,8 +1,111 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
-changes relative to sbcl-1.2.11:
+changes relative to sbcl-1.2.15:
+  * enhancement: by default, timers with a repeat interval do not "catch up"
+    by repeatedly calling their function after a clock discontinuity such as a
+    suspend and resume cycle
+  * bug fix: correctly restore multiple values on the stack in the presence of
+    alien calls. (lp#1489590)
+  * bug fix: MAKE-STRING-OUTPUT-STREAM enforces that :ELEMENT-TYPE
+    is a subtype of CHARACTER.
+  * bug fix: an EQL method specializer no longer causes garbage retention
+    if there are no extant methods using the specializer. (lp#492851)
+
+changes in sbcl-1.2.15 relative to sbcl-1.2.14:
+  * new feature: DEPRECATION declaration for functions, variables and types
+    causes {EARLY,LATE,FINAL}-DEPRECATION-WARNING to be signaled when subject
+    of the declaration is used. Integrated with DESCRIBE, DOCUMENTATION and
+    SB-CLTL2:{VARIABLE,FUNCTION}-INFORMATION. Documented in the "Deprecation"
+    section of the manual.
+  * enhancement: ASDF updated to 3.1.5. (lp#1476867)
+  * enhancement: definitions within PROGN get proper source locations when
+    compiled (needs latest Slime to take advantage of this). (lp#1473147)
+  * enhancement: source locations for DEFCLASS slots now point directly to the
+    slot definitions, not the whole DEFCLASS form.
+  * bug fix: better source location in the presence of quoted forms.
+    (lp#1370561)
+  * bug fix: better source locations inside backqoute. (lp#1361502)
+  * bug fix: HANDLER-BIND requires that the handler-function be
+    a function designator at the time of binding establishment. (lp#1480679)
+  * bug fix: inlined functions surrounded by nested macrolets are properly
+    inlined. (lp#309123)
+
+changes in sbcl-1.2.14 relative to sbcl-1.2.13:
+  * minor incompatible change: The name of a compiled anonymous lambda
+    as returned by the third value of FUNCTION-LAMBDA-EXPRESSION can have
+    a lambda-list-like list following the introductory LAMBDA that is not
+    in general a syntactically valid lambda list. Specifically, it won't
+    retain default values, supplied-p variables, or &KEY or &AUX bindings.
+  * enhancement: DESTRUCTURING-BIND has been totally reimplemented from
+    scratch to address a handful of performance and correctness issues.
+    Some minor behavioral differences exist regarding order of evaluation
+    of default forms for unsupplied &OPTIONAL and &KEY arguments
+    when nested destructuring patterns are involved.
+    (lp#707556, lp#707573, lp#707578, lp#708051)
+  * enhancement: DEFCONSTANT and DEFSTRUCT respect package locks. (lp#1186238,
+    lp#1036716)
+  * enhancement: sb-unicode:normalize-string has a new optional argument,
+    FILTER, a callback which controls which decomposed characters are
+    collected. Useful for stripping away diacritics more efficiently.
+  * bug fix: (TYPE-OF ARRAY) for a non-simple array is subject to change
+    after a call of ADJUST-ARRAY. (lp#1333731)
+  * bug fix: Dynamic-extent allocation with a loop between allocating a value
+    and the start of its environment no longer discards the allocated data
+    when the loop is taken. (lp#1472785)
+  * bug fix: Variable-reference elimination no longer generates incorrect code
+    under certain circumstances. (lp#1446891)
+  * bug fix: variables with EQL types are no longer treated as constants by
+    VOPs, which caused problems with closures being allocated for such
+    variables, but they remained unused. (lp#1390149)
+  * bug fix: Windows installer generates registry key name
+    correctly. (lp#1476447)
+
+changes in sbcl-1.2.13 relative to sbcl-1.2.12:
+  * incompatible change: on success, TRY-SEMAPHORE and WAIT-ON-SEMAPHORE
+    return the new count
+  * enhancement: WAIT-ON-SEMAPHORE accepts a decrement parameter
+  * enhancement: JOIN-THREAD allows distinguishing timeout vs. abort in all
+    situations
+  * enhancement: On Windows DBG_PRINTEXCEPTION_C is handled and its message is
+    printed. (lp#1437947)
+  * bug-fix: TRUENAME works properly on broken symlinks presented as
+    directories. (lp#1400003)
+  * bug fix: Inlined DPB and DEPOSIT-FIELD don't interfere with left-to-right
+    order of argument evaluation. (lp#1458190)
+  * bug fix: (SETF (LDB (BYTE 1 2 JUNK) X) 0) is rightly rejected.
+  * bug fix: DEFSETF lambda lists should not permit argument destructuring.
+  * bug fix: calls to (SETF SLOT-VALUE) on a missing slot would in certain
+    situations incorrectly return the result of a SLOT-MISSING method
+    instead of always returning the new value. (lp#1460381)
+  * bug fix: a DEFMACRO occurring not at toplevel and capturing parts of
+    its lexical environment (thus being a closure) caused expressions
+    involving the macro name to cause corruption in the pretty-printer
+    due to faulty introspection of the lambda list of a closure.
+  * bug fix: out of line MAP/MAP-INTO check that the results produced by the
+    function are of the matching sequence type. (lp#1459581)
+  * bug fix: pretty-printing of '(LET `((,X ,Y)) :B) is handled correctly.
+
+changes in sbcl-1.2.12 relative to sbcl-1.2.11:
+  * minor incompatible change: the SB-C::*POLICY* variable is no longer
+    a list. Code which manipulated it as such (including but not limited
+    to non-bundled releases of ASDF) will need to be revised.
+  * enhancement: The input stream for COMPILE-FILE implements
+    STREAM-LINE-COLUMN.
+  * enhancement: EVAL errors that occur by way of LOAD report the starting
+    line and column number of the erring toplevel form. (lp#565247)
+  * optimization: better MAP and MAP-INTO on known vector result types.
   * bug fix: Read/modify/write macros accessing a place which is a
     composition of CAR+CDR operations, such as (SHIFTF (CADR X) (ELT V 0)),
     do not access subforms more than once. (lp#1450968)
+  * bug fix: short form of DEFSETF no longer allows trailing junk.
+  * bug fix: DEFINE-MODIFY-MACRO respects the provisions of CLHS 5.1.3
+    regarding argument evaluation order. (lp#1452539)
+  * bug fix: POP works as specified in CLHS if the setter for its
+    argument has a side-effect on the existing CAR value. (lp#1454021)
+  * bug fix: Reading "#()" with a positive numeric argument signals a
+    reader error. As specified, reading "#1()" has undefined consequences,
+    so correct portable code should be indifferent to this. (lp#1252100)
+  * bug fix: Malformed reader conditionals such as "(#-no-such-feature)"
+    and "(#+sbcl)" no longer parse as NIL. (lp#1454400)
 
 changes in sbcl-1.2.11 relative to sbcl-1.2.10:
   * enhancement: SET-PPRINT-DISPATCH will warn when given an expression in
@@ -47,7 +150,7 @@ changes in sbcl-1.2.10 relative to sbcl-1.2.9:
     encountering invalid FUNCTION forms like (function 1)
   * bug fix: express proper dependencies in the ASDF contrib, to support
     systems where make runs in parallel.  (lp#1434768; thanks to Nikhil
-    Benesch) 
+    Benesch)
 
 changes in sbcl-1.2.9 relative to sbcl-1.2.8:
   * minor incompatible change and bug fix: unboxed numeric constants

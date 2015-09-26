@@ -68,7 +68,6 @@
     (apply *unwinnage-fun* format-string format-args))
   (values))
 
-(declaim (special *compiler-error-context*))
 
 ;;;; stuff for checking a call against a function type
 ;;;;
@@ -951,7 +950,7 @@
           (error 'simple-type-error
                  :datum (car values)
                  :expected-type atype
-                 :format-control "~@<Value of ~S in~_~A ~I~_is ~2I~_~S, ~
+                 :format-control "~@<Value of ~S in ~_~A ~I~_is ~2I~_~S, ~
                                 ~I~_not a ~2I~_~S.~:@>"
                  :format-arguments (list (car detail) context
                                          (car values)

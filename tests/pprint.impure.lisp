@@ -156,12 +156,22 @@
              (write '`(lambda (,x)) :stream s :pretty t :readably t))
            "`(LAMBDA (,X))")))
 
+(defun unwhitespaceify (string)
+  (let ((string (substitute #\Space #\Newline string)))
+    ;; highly inefficient. this is not how you'd do this in real life.
+    (loop (let ((p (search "  " string)))
+            (when (not p) (return string))
+            (setq string
+                  (concatenate 'string
+                               (subseq string 0 p)
+                               (subseq string (1+ p))))))))
+
 ;;; more backquote printing brokenness, fixed quasi-randomly by CSR.
 ;;; and fixed a little more by DPK.
 (with-test (:name :pprint-more-backquote-brokeness)
   (flet ((try (input expect)
            (assert (equalp (read-from-string expect) input))
-           (let ((actual (write-to-string input :pretty t)))
+           (let ((actual (unwhitespaceify (write-to-string input :pretty t))))
              (unless (equal actual expect)
              (error "Failed test for ~S. Got ~S~%"
                     expect actual)))))
@@ -177,12 +187,10 @@
     (try '`#(,@A ,b c) "`#(,@A ,B C)")
     (try '`(,a . #(foo #() #(,bar) ,bar)) "`(,A . #(FOO #() #(,BAR) ,BAR))")
     (try '(let ((foo (x))) `(let (,foo) (setq ,foo (y)) (baz ,foo)))
-           ;; PPRINT-LET emits a mandatory newline after the bindings,
-           ;; otherwise this'd fit on one line given an adequate right margin.
-           "(LET ((FOO (X)))
-  `(LET (,FOO)
-     (SETQ ,FOO (Y))
-     (BAZ ,FOO)))")))
+           "(LET ((FOO (X))) `(LET (,FOO) (SETQ ,FOO (Y)) (BAZ ,FOO)))")
+    (try '(let `((,a ,b)) :forms) "(LET `((,A ,B)) :FORMS)")
+    (try '(lambda `(,x ,y) :forms) "(LAMBDA `(,X ,Y) :FORMS)")
+    (try '(defun f `(,x ,y) :forms) "(DEFUN F `(,X ,Y) :FORMS)")))
 
 
 ;;; SET-PPRINT-DISPATCH should accept function name arguments, and not
@@ -344,11 +352,13 @@
                             (let ((*print-pretty* nil))
                               (format stream "[frood: ~D]" obj))))
      warning)
+    ;; We expect multiple warnings since the type specifier references
+    ;; multiple undefined things.
     (assert-signal
      (set-pprint-dispatch '(or weasel (and woodle (satisfies thing)))
                           (lambda (stream obj)
                             (format stream "hi ~A!" (type-of obj))))
-     warning)
+     warning 2)
     (write-to-string (macroexpand '(setf (values a b) (floor x y)))
                      :pretty t)
     ;; yay, we're not dead
@@ -397,5 +407,17 @@
                    "#<KNOWN-CONS T>"))
   (assert (string= (write-to-string (cons 'known-cons (cons 'known-cons t)) :pretty t)
                    "#<KNOWN-CONS #<KNOWN-CONS T>>")))
+
+;; force MACDADDY to be a closure over X.
+(let ((x 3)) (defmacro macdaddy (a b &body z) a b z `(who-cares ,x)) (incf x))
+
+(with-test (:name :closure-macro-arglist)
+  ;; assert correct test setup - MACDADDY is a closure
+  (assert (eq (sb-kernel:fun-subtype (macro-function 'macdaddy))
+              sb-vm:closure-header-widetag))
+  ;; MACRO-INDENTATION used %simple-fun-arglist instead of %fun-arglist.
+  ;; Depending on your luck it would either not return the right answer,
+  ;; or crash, depending on what lay at 4 words past the function address.
+  (assert (= (sb-pretty::macro-indentation 'macdaddy) 2)))
 
 ;;; success

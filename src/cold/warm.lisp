@@ -65,6 +65,8 @@
 
 ;;;; compiling and loading more of the system
 
+(load "src/cold/muffler.lisp")
+
 ;;; FIXME: CMU CL's pclcom.lisp had extra optional stuff wrapped around
 ;;; COMPILE-PCL, at least some of which we should probably have too:
 ;;;
@@ -103,11 +105,11 @@
                 ;; order dependencies from the old PCL defsys.lisp
                 ;; dependency database.
                 #+nil "src/pcl/walk" ; #+NIL = moved to build-order.lisp-expr
-                "SRC;PCL;EARLY-LOW"
+                #+nil "SRC;PCL;EARLY-LOW"
                 "SRC;PCL;MACROS"
                 "SRC;PCL;COMPILER-SUPPORT"
-                "SRC;PCL;LOW"
-                "SRC;PCL;SLOT-NAME"
+                #+nil "SRC;PCL;LOW"
+                #+nil "SRC;PCL;SLOT-NAME" ; moved to build-order.lisp-expr
                 "SRC;PCL;DEFCLASS"
                 "SRC;PCL;DEFS"
                 "SRC;PCL;FNGEN"
@@ -162,8 +164,12 @@
                 "SRC;CODE;STEP"
                 "SRC;CODE;WARM-LIB"
                 #+win32 "SRC;CODE;WARM-MSWIN"
-                "SRC;CODE;RUN-PROGRAM")))
+                "SRC;CODE;RUN-PROGRAM"))
+      (sb-c::*handled-conditions* sb-c::*handled-conditions*))
  (declare (special *compile-files-p*))
+ (proclaim '(sb-ext:muffle-conditions
+             (or (satisfies unable-to-optimize-note-p)
+                 (satisfies optional+key-style-warning-p))))
  (flet
     ((do-srcs (list)
        (dolist (stem list)
@@ -224,6 +230,10 @@
                             (print-unreadable-object (obj stream :type t)
                               (write (sb-kernel:classoid-name obj) :stream stream))))
      (set-pprint-dispatch
+      'sb-kernel:ctype (lambda (stream obj)
+                         (print-unreadable-object (obj stream :type t)
+                           (prin1 (sb-kernel:type-specifier obj) stream))))
+     (set-pprint-dispatch
       'package (lambda (stream obj)
                  (print-unreadable-object (obj stream :type t)
                    (write (package-name obj) :stream stream))))
@@ -239,6 +249,19 @@
       'restart (lambda (stream obj)
                  (print-unreadable-object (obj stream :type t :identity t)
                    (write (restart-name obj) :stream stream))))
+     ;; These next two are coded in a totally brittle way, but no more wrong
+     ;; than typing the decoding expressions into the debugger to decipher
+     ;; a backtrace. Anyway, if it ceases to print right, just fix it again!
+     (set-pprint-dispatch
+      'generic-function
+      (lambda (stream obj)
+        (format stream "<~S ~S>" (type-of obj)
+                (svref (sb-kernel:%funcallable-instance-info obj 1) 5))))
+     (set-pprint-dispatch
+      'class
+      (lambda (stream obj)
+        (format stream "<~S ~S>" (type-of obj)
+                (svref (sb-kernel:%instance-ref obj 1) 3))))
      (with-compilation-unit ()
        (let ((*compile-print* nil))
          (do-srcs pcl-srcs)))

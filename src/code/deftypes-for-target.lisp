@@ -121,6 +121,9 @@
 (sb!xc:deftype restart-designator ()
   '(or (and symbol (not null)) restart))
 
+(sb!xc:deftype type-specifier ()
+  '(or list symbol classoid class))
+
 ;;; array rank, total size...
 (sb!xc:deftype array-rank () `(integer 0 (,sb!xc:array-rank-limit)))
 (sb!xc:deftype array-total-size ()
@@ -141,7 +144,7 @@
 (sb!xc:deftype logical-host-designator ()
   '(or host string))
 
-(sb!xc:deftype package-designator () '(or string-designator sb!xc:package))
+(sb!xc:deftype package-designator () '(or string-designator package))
 ;;; a designator for a list of symbols
 (sb!xc:deftype symbols-designator () '(or list symbol))
 
@@ -171,10 +174,6 @@
 ;;; COMPILE-FILE and friends.
 (sb!xc:deftype external-format-designator ()
   '(or keyword (cons keyword)))
-
-;;; an object suitable for input to standard functions that accept
-;;; "environment objects" (of the ANSI glossary)
-(sb!xc:deftype lexenv-designator () '(or lexenv null))
 
 ;;; a thing that can be passed to FUNCALL & friends
 ;;;

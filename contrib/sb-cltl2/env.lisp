@@ -144,6 +144,18 @@
             (push entry-cons ret))))
       (nreverse ret))))
 
+(defun maybe-deprecation-entry (info)
+  (when info
+    (with-accessors ((state sb-int:deprecation-info-state)
+                     (software sb-int:deprecation-info-software)
+                     (version sb-int:deprecation-info-version)
+                     (replacements sb-int:deprecation-info-replacements))
+        info
+      (list (cons 'sb-ext:deprecated
+                  (list :state state
+                        :since (list software version)
+                        :replacements replacements))))))
+
 ;;; Retrieve the user-supplied (from define-declaration) value for
 ;;; the declaration with the given NAME
 (defun extra-decl-info (name env)
@@ -154,6 +166,11 @@
         (return-from extra-decl-info (cddr entry))))
     nil))
 
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defmacro list-cons-when (test car cdr)
+    `(when ,test
+       (list (cons ,car ,cdr)))))
 
 (declaim (ftype (sfunction ((or symbol cons) &optional (or null lexenv))
                            (values (member nil :function :macro :special-form)
@@ -201,6 +218,31 @@ CARS of the alist include:
     associated with NAME. If the CDR is FUNCTION the alist element may
     be omitted.
 
+  SB-EXT:DEPRECATED
+    \(SBCL specific)
+    The CDR is a plist containing the following properties
+
+      :STATE ( :EARLY | :LATE | :FINAL )
+        Use of :EARLY deprecated functions signals a STYLE-WARNING at
+        compile-time.
+
+        Use of :LATE deprecated functions signals a full WARNING at
+        compile-time.
+
+        Use of :FINAL deprecated functions signals a full WARNING at
+        compile-time and an error at runtime.
+
+      :SINCE (SOFTWARE VERSION)
+        VERSION is a string designating the version since which the
+        function has been deprecated. SOFTWARE is NIL or the name of
+        the software to which VERSION refers, e.g. \"SBCL\" for
+        deprecated functions in SBCL.
+
+      :REPLACEMENTS REPLACEMENTS
+        When this property is present, REPLACEMENTS is a list of
+        symbols naming functions that should be used instead of the
+        deprecated function.
+
 In addition to these declarations defined using DEFINE-DECLARATION may
 appear."
   (let* ((*lexenv* (or env (make-null-lexenv)))
@@ -240,17 +282,18 @@ appear."
                 inlinep (info :function :inlinep name))))))
     (values binding
             localp
-            (let (alist)
-              (when (and ftype (neq *universal-fun-type* ftype))
-                (push (cons 'ftype (type-specifier ftype)) alist))
-              (ecase inlinep
-                ((:inline :maybe-inline) (push (cons 'inline 'inline) alist))
-                (:notinline (push (cons 'inline 'notinline) alist))
-                ((nil)))
-              (when dx (push (cons 'dynamic-extent t) alist))
-              (append alist (extra-pairs :function name fun *lexenv*))))))
-
-
+            (nconc (ecase inlinep
+                     ((:inline :maybe-inline)
+                      (list '(inline . inline)))
+                     (:notinline
+                      (list '(inline . notinline)))
+                     ((nil)))
+                   (list-cons-when (and ftype (neq *universal-fun-type* ftype))
+                     'ftype (type-specifier ftype))
+                   (list-cons-when dx 'dynamic-extent t)
+                   (maybe-deprecation-entry
+                    (info :function :deprecated name))
+                   (extra-pairs :function name fun *lexenv*)))))
 
 (declaim (ftype (sfunction
                  (symbol &optional (or null lexenv))
@@ -311,8 +354,33 @@ CARS of the alist include:
     be omitted.
 
   SB-EXT:ALWAYS-BOUND
-    If CDR is T, NAME has been declared as SB-EXT:ALWAYS-BOUND \(SBCL
-    specific.)
+    \(SBCL specific)
+    If CDR is T, NAME has been declared as SB-EXT:ALWAYS-BOUND
+
+  SB-EXT:DEPRECATED
+    \(SBCL specific)
+    The CDR is a plist containing the following properties
+
+      :STATE ( :EARLY | :LATE | :FINAL )
+        Use of :EARLY deprecated variables signals a STYLE-WARNING at
+        compile-time.
+
+        Use of :LATE deprecated variables signals a full WARNING at
+        compile-time.
+
+        Use of :FINAL deprecated variables signals a full WARNING at
+        compile-time and an error at runtime.
+
+      :SINCE (SOFTWARE VERSION)
+        VERSION is a string designating the version since which the
+        variable has been deprecated. SOFTWARE is NIL or the name of
+        the software to which VERSION refers, e.g. \"SBCL\" for
+        deprecated variables in SBCL.
+
+      :REPLACEMENTS REPLACEMENTS
+        When this property is present, REPLACEMENTS is a list of
+        symbols naming variables that should be used instead of the
+        deprecated variable.
 
 In addition to these declarations defined using DEFINE-DECLARATION may
 appear."
@@ -358,14 +426,15 @@ appear."
                 localp nil))))
     (values binding
             localp
-            (let (alist)
-              (when ignorep (push (cons 'ignore t) alist))
-              (when (and type (neq *universal-type* type))
-                (push (cons 'type (type-specifier type)) alist))
-              (when dx (push (cons 'dynamic-extent t) alist))
-              (when (info :variable :always-bound name)
-                (push (cons 'sb-ext:always-bound t) alist))
-              (append alist (extra-pairs :variable name var *lexenv*))))))
+            (nconc (list-cons-when ignorep 'ignore t)
+                   (list-cons-when (and type (neq *universal-type* type))
+                     'type (type-specifier type))
+                   (list-cons-when dx 'dynamic-extent t)
+                   (list-cons-when (info :variable :always-bound name)
+                     'sb-ext:always-bound t)
+                   (maybe-deprecation-entry
+                    (info :variable :deprecated name))
+                   (extra-pairs :variable name var *lexenv*)))))
 
 (declaim (ftype (sfunction (symbol &optional (or null lexenv)) t)
                 declaration-information))
@@ -386,16 +455,14 @@ the condition types that have been muffled."
   (let ((env (or env (make-null-lexenv))))
     (case declaration-name
       (optimize
-       (let ((policy (sb-c::lexenv-policy env)))
-         (collect ((res))
-           (dolist (name sb-c::*policy-qualities*)
-             (res (list name (sb-c::policy-quality policy name))))
-           (loop for (name . nil) in sb-c::*policy-dependent-qualities*
-                 do (res (list name (sb-c::policy-quality policy name))))
-           (res))))
+       ;; CLtL2-mandated behavior:
+       ;; "The returned list always contains an entry for each of the standard
+       ;; qualities and for each of the implementation-specific qualities"
+       (sb-c::policy-to-decl-spec (sb-c::lexenv-policy env) nil t))
       (sb-ext:muffle-conditions
-       (car (rassoc 'muffle-warning
-                    (sb-c::lexenv-handled-conditions env))))
+       (sb-int:awhen (car (rassoc 'muffle-warning
+                                  (sb-c::lexenv-handled-conditions env)))
+         (sb-kernel:type-specifier it)))
       (declaration
        (copy-list sb-c::*recognized-declarations*))
       (t (if (info :declaration :handler declaration-name)
@@ -410,14 +477,8 @@ lambda expression will parse its form argument, binding the variables in
 LAMBDA-LIST appropriately, and then execute BODY with those bindings in
 effect."
   (declare (ignore env))
-  (with-unique-names (whole environment)
-    (multiple-value-bind (body decls)
-        (parse-defmacro lambda-list whole body name
-                        'parse-macro
-                        :environment environment)
-      `(lambda (,whole ,environment)
-         ,@decls
-         ,body))))
+  (make-macro-lambda (if (and name (symbolp name)) (string name) "PARSE-MACRO")
+                     lambda-list body 'parse-macro name))
 
 (defun enclose (lambda-expression &optional environment)
   "Return a function consistent with LAMBDA-EXPRESSION in ENVIRONMENT: the

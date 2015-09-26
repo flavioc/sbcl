@@ -26,6 +26,10 @@
   (labels ((sane-expr-p (x)
              (typecase x
                (symbol (and (string/= x "SB-XC") (string/= x "SB-XC-HOST")))
+               ;; This allows you to write #!+(host-feature sbcl) <stuff>
+               ;; to muffle conditions, bypassing the "probable XC bug" check.
+               ;; Using the escape hatch is assumed never to be a mistake.
+               ((cons (eql :host-feature)) t)
                (cons (every #'sane-expr-p (cdr x))))))
     (unless (sane-expr-p feature)
       (error "Target feature expression ~S looks screwy" feature)))
@@ -36,11 +40,14 @@
             (ecase (first feature)
               (:or  (some  #'subfeature-in-list-p (rest feature)))
               (:and (every #'subfeature-in-list-p (rest feature)))
-              (:not (let ((rest (cdr feature)))
-                      (if (or (null (car rest)) (cdr rest))
-                        (error "wrong number of terms in compound feature ~S"
-                               feature)
-                        (not (subfeature-in-list-p (second feature)))))))))))
+              ((:host-feature :not)
+               (destructuring-bind (subexpr) (cdr feature)
+                 (cond ((eq (first feature) :host-feature)
+                        ;; (:HOST-FEATURE :sym) looks in *FEATURES* for :SYM
+                        (check-type subexpr symbol)
+                        (member subexpr *features* :test #'eq))
+                       (t
+                        (not (subfeature-in-list-p subexpr)))))))))))
 (compile 'feature-in-list-p)
 
 (defun shebang-reader (stream sub-character infix-parameter)
@@ -50,20 +57,16 @@
   (let ((next-char (read-char stream)))
     (unless (find next-char "+-")
       (error "illegal read syntax: #!~C" next-char))
-    ;; When test is not satisfied
-    ;; FIXME: clearer if order of NOT-P and (NOT NOT-P) were reversed? then
-    ;; would become "unless test is satisfied"..
-    (when (let* ((*package* (find-package "KEYWORD"))
-                 (*read-suppress* nil)
-                 (not-p (char= next-char #\-))
-                 (feature (read stream)))
-            (if (feature-in-list-p feature *shebang-features*)
-                not-p
-                (not not-p)))
-      ;; Read (and discard) a form from input.
-      (let ((*read-suppress* t))
-        (read stream t nil t))))
-  (values))
+    (if (char= (if (let* ((*package* (find-package "KEYWORD"))
+                          (*read-suppress* nil)
+                          (feature (read stream)))
+                     (feature-in-list-p feature *shebang-features*))
+                   #\+ #\-) next-char)
+        (read stream t nil t)
+        ;; Read (and discard) a form from input.
+        (let ((*read-suppress* t))
+          (read stream t nil t)
+          (values)))))
 (compile 'shebang-reader)
 
 (set-dispatch-macro-character #\# #\! #'shebang-reader)

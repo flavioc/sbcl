@@ -450,6 +450,7 @@ Length should be adjusted when the standard changes.")
                (line-break-index (gethash code-point *line-break-class-table* 0))
                (age-index (gethash code-point *age-table* 0))
                decomposition)
+          #+nil
           (when (and (not cl-both-case-p)
                      (< gc-index 2))
             (format t "~A~%" name))
@@ -599,6 +600,7 @@ Length should be adjusted when the standard changes.")
                                   :type "txt"
                                   :defaults *unicode-character-database*)
                    :direction :input)
+    (format t "~%//slurp-ucd~%")
     (loop for line = (read-line nil nil)
           while line
           do (slurp-ucd-line line)))
@@ -1016,9 +1018,13 @@ Used to look up block data.")
                    :if-exists :supersede
                    :if-does-not-exist :create)
     (with-standard-io-syntax
-      (let ((*print-pretty* t))
-        (prin1 (mapcar #'(lambda (x) (cons (car x) (read-from-string (cdr x))))
-                       *different-numerics*)))))
+      (let ((*print-pretty* t)
+            (result (make-array (* (length *different-numerics*) 2))))
+        (loop for (code . value) in (sort *different-numerics* #'< :key #'car)
+              for i by 2
+              do (setf (aref result i) code
+                       (aref result (1+ i)) (read-from-string value)))
+        (prin1 result))))
   (with-open-file (*standard-output*
                    (make-pathname :name "titlecases"
                                   :type "lisp-expr"

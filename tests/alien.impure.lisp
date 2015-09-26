@@ -36,14 +36,17 @@
 
 (multiple-value-bind (function warningsp failurep)
     (compile nil '(lambda () (ftype-correctness)))
+  (declare (ignore function failurep))
   (assert warningsp))
 
 (multiple-value-bind (function warningsp failurep)
     (compile nil '(lambda () (ftype-correctness "FOO")))
+  (declare (ignore function failurep))
   (assert (not warningsp)))
 
 (multiple-value-bind (function warningsp failurep)
     (compile nil '(lambda () (ftype-correctness "FOO" "BAR")))
+  (declare (ignore function failurep))
   (assert warningsp))
 
 ;;; This used to break due to too eager auxiliary type twiddling in
@@ -437,4 +440,13 @@
     (file-position stream 4294967310)
     (assert (= 4294967310 (file-position stream)))))
 
-;;; success
+(with-test (:name :stack-misalignment)
+  (locally (declare (optimize (debug 2)))
+    (labels ((foo ()
+               (declare (optimize speed))
+               (sb-ext:get-time-of-day)))
+      (assert (equal (multiple-value-list
+                      (multiple-value-prog1
+                          (apply #'values (list 1))
+                        (foo)))
+                     '(1))))))

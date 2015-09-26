@@ -24,25 +24,20 @@
 ;;;; warranty about the software, its performance or its conformity to any
 ;;;; specification.
 
-(in-package "SB-PCL")
+(in-package "SB!PCL")
 
-(/show "starting early-low.lisp")
+(declaim (type (member nil early braid complete) **boot-state**))
+(defglobal **boot-state** nil)
+
+(/show0 "starting early-low.lisp")
 
-;;; FIXME: The PCL package is internal and is used by code in potential
-;;; bottlenecks. Access to it might be faster through #.(find-package "SB-PCL")
-;;; than through *PCL-PACKAGE*. And since it's internal, no one should be
+;;; The PCL package is internal and is used by code in potential
+;;; bottlenecks. And since it's internal, no one should be
 ;;; doing things like deleting and recreating it in a running target Lisp.
-;;; So perhaps we should replace it uses of *PCL-PACKAGE* with uses of
-;;; (PCL-PACKAGE), and make PCL-PACKAGE a macro which expands into
-;;; the SB-PCL package itself. Maybe we should even use this trick for
-;;; COMMON-LISP and KEYWORD, too. (And the definition of PCL-PACKAGE etc.
-;;; could be made less viciously brittle when SB-FLUID.)
-;;; (Or perhaps just define a macro
-;;;   (DEFMACRO PKG (NAME)
-;;;     #-SB-FLUID (FIND-PACKAGE NAME)
-;;;     #+SB-FLUID `(FIND-PACKAGE ,NAME))
-;;; and use that to replace all three variables.)
-(defvar *pcl-package*                (find-package "SB-PCL"))
+;;; By the time we get to compiling the rest of PCL,
+;;; the package will have been renamed,
+;;; so subsequently compiled code should refer to "SB-PCL", not "SB!PCL".
+(define-symbol-macro *pcl-package* (load-time-value (find-package "SB-PCL") t))
 
 (declaim (inline defstruct-classoid-p))
 (defun defstruct-classoid-p (classoid)
@@ -70,10 +65,14 @@
    (intern (apply #'format nil format-string format-arguments) package)))
 
 (defun make-class-symbol (class-name)
-  (format-symbol *pcl-package* "*THE-CLASS-~A*" (symbol-name class-name)))
+  ;; Reference a package that is now SB!PCL but later SB-PCL
+  (format-symbol (load-time-value (find-package "SB!PCL") t)
+                 "*THE-CLASS-~A*" (symbol-name class-name)))
 
 (defun make-wrapper-symbol (class-name)
-  (format-symbol *pcl-package* "*THE-WRAPPER-~A*" (symbol-name class-name)))
+  ;; Reference a package that is now SB!PCL but later SB-PCL
+  (format-symbol (load-time-value (find-package "SB!PCL") t)
+                 "*THE-WRAPPER-~A*" (symbol-name class-name)))
 
 (defun condition-type-p (type)
   (and (symbolp type)
@@ -131,4 +130,4 @@
                   *the-wrapper-of-complex* *the-wrapper-of-character*
                   *the-wrapper-of-bit-vector* *the-wrapper-of-array*))
 
-(/show "finished with early-low.lisp")
+(/show0 "finished with early-low.lisp")

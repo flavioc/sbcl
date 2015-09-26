@@ -254,21 +254,6 @@
   (fun (missing-arg) :type function)
   (before-address nil :type (member t nil)))
 
-(defstruct (segment (:conc-name seg-)
-                    (:constructor %make-segment)
-                    (:copier nil))
-  (sap-maker (missing-arg)
-             :type (function () sb!sys:system-area-pointer))
-  ;; Length in bytes of the range of memory covered by this segment.
-  (length 0 :type disassem-length)
-  ;; Length of the memory range excluding any trailing untagged data.
-  ;; Defaults to 'length' but could be shorter.
-  (opcodes-length 0 :type disassem-length)
-  (virtual-location 0 :type address)
-  (storage-info nil :type (or null storage-info))
-  (code nil :type (or null sb!kernel:code-component))
-  (unboxed-data-range nil :type (or null (cons fixnum fixnum)))
-  (hooks nil :type list))
 (def!method print-object ((seg segment) stream)
   (print-unreadable-object (seg stream :type t)
     (let ((addr (sb!sys:sap-int (funcall (seg-sap-maker seg)))))
@@ -918,6 +903,7 @@
 #!-sb-fluid (declaim (inline sap-maker))
 (defun sap-maker (function input offset)
   (declare (optimize (speed 3))
+           (muffle-conditions compiler-note)
            (type (function (t) sb!sys:system-area-pointer) function)
            (type offset offset))
   (let ((old-sap (sb!sys:sap+ (funcall function input) offset)))
@@ -945,6 +931,7 @@
 
 (defun memory-sap-maker (address)
   (declare (optimize (speed 3))
+           (muffle-conditions compiler-note)
            (type address address))
   (let ((sap (sb!sys:int-sap address)))
     (lambda () sap)))
@@ -1066,10 +1053,6 @@
 
 (defstruct (location-group (:copier nil))
   (locations #() :type (vector (or list fixnum))))
-
-(defstruct (storage-info (:copier nil))
-  (groups nil :type list)               ; alist of (name . location-group)
-  (debug-vars #() :type vector))
 
 ;;; Return the vector of DEBUG-VARs currently associated with DSTATE.
 (defun dstate-debug-vars (dstate)
@@ -1544,10 +1527,7 @@
            (disassemble-fun fun
                             :stream stream
                             :use-labels use-labels)))
-    (let ((funs (compiled-funs-or-lose object)))
-      (if (listp funs)
-          (dolist (fun funs) (disassemble1 fun))
-          (disassemble1 funs))))
+    (mapc #'disassemble1 (ensure-list (compiled-funs-or-lose object))))
   nil)
 
 ;;; Disassembles the given area of memory starting at ADDRESS and
@@ -1674,7 +1654,6 @@
 ;;; constant area of the code-object in the current segment and T, or
 ;;; NIL and NIL if there is no code-object in the current segment.
 (defun get-code-constant (byte-offset dstate)
-  #!+sb-doc
   (declare (type offset byte-offset)
            (type disassem-state dstate))
   (let ((code (seg-code (dstate-segment dstate))))
@@ -1752,6 +1731,7 @@
            (type (unsigned-byte 16) offset)
            (type (member 1 2 4 8) length)
            (type (member :little-endian :big-endian) byte-order)
+           (muffle-conditions compiler-note) ; integer coercion, oh well
            (optimize (speed 3) (safety 0)))
   (ecase length
     (1 (sb!sys:sap-ref-8 sap offset))
@@ -1950,7 +1930,7 @@
       (return (note (lambda (s) (prin1 symbol s)) dstate)))))
 
 (defun get-internal-error-name (errnum)
-  (cdr (svref sb!c:*backend-internal-errors* errnum)))
+  (cdr (svref sb!c:+backend-internal-errors+ errnum)))
 
 (defun get-sc-name (sc-offs)
   (sb!c:location-print-name
@@ -1990,18 +1970,26 @@
     (when stream
       (setf (dstate-cur-offs dstate)
             (dstate-next-offs dstate))
-      (flet ((emit-err-arg (note)
+      (flet ((emit-err-arg ()
                (let ((num (pop lengths)))
                  (print-notes-and-newline stream dstate)
                  (print-current-address stream dstate)
                  (print-inst num stream dstate)
                  (print-bytes num stream dstate)
-                 (incf (dstate-cur-offs dstate) num)
-                 (when note
-                   (note note dstate)))))
-        (emit-err-arg nil)
-        (emit-err-arg (symbol-name (get-internal-error-name errnum)))
+                 (incf (dstate-cur-offs dstate) num)))
+             (emit-note (note)
+               (when note
+                 (note note dstate))))
+        (emit-err-arg)
+        (emit-err-arg)
+        (emit-note (symbol-name (get-internal-error-name errnum)))
         (dolist (sc-offs sc-offsets)
-          (emit-err-arg (get-sc-name sc-offs)))))
+          (emit-err-arg)
+          (if (= (sb!c:sc-offset-scn sc-offs)
+                 sb!vm:constant-sc-number)
+              (note-code-constant (* (1- (sb!c:sc-offset-offset sc-offs))
+                                     sb!vm:n-word-bytes)
+                                  dstate)
+              (emit-note (get-sc-name sc-offs))))))
     (incf (dstate-next-offs dstate)
           adjust)))

@@ -16,11 +16,12 @@
   (declare (special *muffled-warnings*))
   (typep warning *muffled-warnings*))
 
-(defglobal **initial-handler-clusters**
-  `(((,(lambda (condition)
-         (typep condition 'warning))
+;; Host lisp does not need a value for this, so start it out as NIL.
+(defglobal **initial-handler-clusters** nil)
+(setq **initial-handler-clusters**
+  `(((,(find-classoid-cell 'warning :create t)
       .
-      ,(lambda (warning)
+      ,(named-lambda "MAYBE-MUFFLE" (warning)
          (when (muffle-warning-p warning)
            (muffle-warning warning)))))))
 
@@ -42,7 +43,14 @@
 
 ;;; a list of lists of currently active RESTART instances. maintained
 ;;; by RESTART-BIND.
-(defvar *restart-clusters* '())
+;;; This variable is proclaimed to be "eventually" always-bound,
+;;; meaning in the loaded code. If DEFVAR were used, the compiler knows that
+;;; BOUNDP will be T, and therefore a code deletion note should be issused
+;;; for the initialization expression (UNLESS (BOUNDP x) <initform>).
+;;; Technically it's not even right to use DEFVAR because it works only
+;;; if the initializer is really NIL, since that is what %DEFVAR will assign
+;;; on account of the fact that an initializer was supplied at all.
+(defparameter *restart-clusters* '())
 
 (def!method print-object ((restart restart) stream)
   (if *print-escape*

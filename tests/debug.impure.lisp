@@ -81,7 +81,7 @@
 ;;; and that it contains the frames we expect, doesn't contain any
 ;;; "bogus stack frame"s, and contains the appropriate toplevel call
 ;;; and hasn't been cut off anywhere.
-(defun verify-backtrace (test-function frame-specs &key (allow-stunted nil) details)
+(defun verify-backtrace (test-function frame-specs &key details)
   (labels ((args-equal (want real)
              (cond ((eq '&rest (car want))
                     t)
@@ -198,13 +198,7 @@
                    (list `(flet test :in ,*p*) #'not-optimized))))))
 
 (with-test (:name :backtrace-interrupted-condition-wait
-            :skipped-on '(not :sb-thread)
-                  ;; For some unfathomable reason the backtrace becomes
-                  ;; stunted, ending at _sigtramp, when we add :TIMEOUT NIL to
-                  ;; the frame we expect. If we leave it out, the backtrace is
-                  ;; fine -- but the test fails. I can only boggle right now.
-            :fails-on `(or (and :x86 :linux)
-                           :win32))
+            :skipped-on '(not :sb-thread))
   (let ((m (sb-thread:make-mutex))
         (q (sb-thread:make-waitqueue)))
     (assert (verify-backtrace
@@ -858,7 +852,8 @@
    (block nil
      (handler-bind ((error (lambda (e)
                              (declare (ignore e))
-                             (return (< (length (car (sb-debug:backtrace-as-list 1))) 10)))))
+                             (return (< (length (car (sb-debug:list-backtrace :count 1)))
+                                        10)))))
        (funcall (compile nil `(lambda (i) (declare ((mod 65536) i)) i)) nil)))))
 
 ;;; bug-1261646

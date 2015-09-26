@@ -179,7 +179,7 @@
 ;;; Parse TYPE as an alien type specifier and return the resultant
 ;;; ALIEN-TYPE structure.
 (defun parse-alien-type (type env)
-  (declare (type (or sb!kernel:lexenv null) env))
+  (declare (type sb!kernel:lexenv-designator env))
   (if (consp type)
       (let ((translator (info :alien-type :translator (car type))))
         (unless translator
@@ -198,7 +198,7 @@
          (error "unknown alien type: ~S" type)))))
 
 (defun auxiliary-alien-type (kind name env)
-  (declare (type (or sb!kernel:lexenv null) env))
+  (declare (type sb!kernel:lexenv-designator env))
   (flet ((aux-defn-matches (x)
            (and (eq (first x) kind) (eq (second x) name))))
     (let ((in-auxiliaries
@@ -215,7 +215,7 @@
              (info :alien-type :enum name)))))))
 
 (defun (setf auxiliary-alien-type) (new-value kind name env)
-  (declare (type (or sb!kernel:lexenv null) env))
+  (declare (type sb!kernel:lexenv-designator env))
   (flet ((aux-defn-matches (x)
            (and (eq (first x) kind) (eq (second x) name))))
     (when (find-if #'aux-defn-matches *new-auxiliary-types*)
@@ -238,6 +238,16 @@
                (info :alien-type :enum name)))
         (error "attempt to shadow definition of ~A ~S" kind name)))))
 
+(def!struct (alien-type
+             (:make-load-form-fun sb!kernel:just-dump-it-normally)
+             (:constructor make-alien-type
+                           (&key class bits alignment
+                            &aux (alignment
+                                  (or alignment (guess-alignment bits))))))
+  (class 'root :type symbol)
+  (bits nil :type (or null unsigned-byte))
+  (alignment nil :type (or null unsigned-byte)))
+
 (defun unparse-alien-type (type)
   #!+sb-doc
   "Convert the alien-type structure TYPE back into a list specification of
@@ -255,28 +265,18 @@
 ;;;; alien type defining stuff
 
 (def!macro define-alien-type-translator (name lambda-list &body body)
-  (with-unique-names (whole env)
-    (let ((defun-name (symbolicate "ALIEN-" name "-TYPE-TRANSLATOR")))
-      (multiple-value-bind (body decls docs)
-          (sb!kernel:parse-defmacro lambda-list whole body name
-                                    'define-alien-type-translator
-                                    :environment env)
-        `(eval-when (:compile-toplevel :load-toplevel :execute)
-           (defun ,defun-name (,whole ,env)
-             (declare (ignorable ,env))
-             ,@decls
-             (block ,name
-               ,body))
-           (%define-alien-type-translator ',name #',defun-name ,docs))))))
+  (let ((defun-name (symbolicate "ALIEN-" name "-TYPE-TRANSLATOR")))
+    `(eval-when (:compile-toplevel :load-toplevel :execute)
+       (setf (symbol-function ',defun-name)
+             ,(make-macro-lambda defun-name lambda-list body
+                                 'define-alien-type-translator name))
+       (%define-alien-type-translator ',name #',defun-name))))
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun %define-alien-type-translator (name translator docs)
-    (declare (ignore docs))
+  (defun %define-alien-type-translator (name translator)
     (setf (info :alien-type :kind name) :primitive)
     (setf (info :alien-type :translator name) translator)
     (clear-info :alien-type :definition name)
-    #+nil
-    (setf (fdocumentation name 'alien-type) docs)
     name))
 
 (def!macro define-alien-type (name type &environment env)
@@ -288,14 +288,15 @@
     (let ((alien-type (parse-alien-type type env)))
       `(eval-when (:compile-toplevel :load-toplevel :execute)
          ,@(when *new-auxiliary-types*
-             `((%def-auxiliary-alien-types ',*new-auxiliary-types*)))
+             `((%def-auxiliary-alien-types ',*new-auxiliary-types*
+                                           (sb!c:source-location))))
          ,@(when name
              `((%define-alien-type ',name ',alien-type)
                (setf (info :source-location :alien-type ',name)
                      (sb!c:source-location))))))))
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun %def-auxiliary-alien-types (types)
+  (defun %def-auxiliary-alien-types (types source-location)
     (dolist (info types)
       ;; Clear up the type we're about to define from the toplevel
       ;; *new-auxiliary-types* (local scopes take care of themselves).
@@ -313,11 +314,14 @@
                               (warn
                                "redefining ~A ~S to be:~%  ~S,~%was:~%  ~S"
                                kind name defn old))
-                            (setf (info :alien-type ,kind name) defn))))
+                            (setf (info :alien-type ,kind name) defn
+                                  (info :source-location :alien-type name)
+                                  source-location))))
           (ecase kind
             (:struct (frob :struct))
             (:union (frob :union))
             (:enum (frob :enum)))))))
+
   (defun %define-alien-type (name new)
     (ecase (info :alien-type :kind name)
       (:primitive
@@ -339,13 +343,6 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (create-alien-type-class-if-necessary 'root 'alien-type nil))
 
-(def!struct (alien-type
-             (:make-load-form-fun sb!kernel:just-dump-it-normally)
-             (:constructor make-alien-type (&key class bits alignment
-                                            &aux (alignment (or alignment (guess-alignment bits))))))
-  (class 'root :type symbol)
-  (bits nil :type (or null unsigned-byte))
-  (alignment nil :type (or null unsigned-byte)))
 (def!method print-object ((type alien-type) stream)
   (print-unreadable-object (type stream :type t)
     ;; Kludge to avoid printing #'(SIGNED 64) instead of (FUNCTION (SIGNED 64))
@@ -1019,7 +1016,7 @@
 ;;; MAKE-ALIEN-RECORD-TYPE to %MAKE-ALIEN-RECORD-TYPE and use
 ;;; ENSURE-ALIEN-RECORD-TYPE instead. --NS 20040729
 (defun parse-alien-record-type (kind name fields env)
-  (declare (type (or sb!kernel:lexenv null) env))
+  (declare (type sb!kernel:lexenv-designator env))
   (flet ((frob-type (type new-fields alignment bits)
            (setf (alien-record-type-fields type) new-fields
                  (alien-record-type-alignment type) alignment

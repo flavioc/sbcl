@@ -50,7 +50,6 @@
                                        (or doc xrefs))))
     (when (policy bind (>= debug 1))
       (let ((args (functional-arg-documentation internal-fun)))
-        (aver (not (eq args :unspecified)))
         ;; When the component is dumped, the arglists of the entry
         ;; points will be dumped.  If they contain values that need
         ;; make-load-form processing then we need to do it now (bug

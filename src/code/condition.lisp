@@ -17,48 +17,6 @@
 
 (/show0 "condition.lisp 20")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-
-(/show0 "condition.lisp 24")
-
-(def!struct (condition-classoid (:include classoid)
-                                (:constructor make-condition-classoid))
-  ;; list of CONDITION-SLOT structures for the direct slots of this
-  ;; class
-  (slots nil :type list)
-  ;; list of CONDITION-SLOT structures for all of the effective class
-  ;; slots of this class
-  (class-slots nil :type list)
-  ;; report function or NIL
-  (report nil :type (or function null))
-  ;; list of specifications of the form
-  ;;
-  ;;   (INITARG INITFORM THUNK)
-  ;;
-  ;; where THUNK, when called without arguments, returns the value for
-  ;; INITARG.
-  (direct-default-initargs () :type list)
-  ;; class precedence list as a list of CLASS objects, with all
-  ;; non-CONDITION classes removed
-  (cpl () :type list)
-  ;; a list of all the effective instance allocation slots of this
-  ;; class that have a non-constant initform or default-initarg.
-  ;; Values for these slots must be computed in the dynamic
-  ;; environment of MAKE-CONDITION.
-  (hairy-slots nil :type list))
-
-(/show0 "condition.lisp 49")
-
-) ; EVAL-WHEN
-
-(!defstruct-with-alternate-metaclass condition
-  :slot-names (actual-initargs assigned-slots)
-  :boa-constructor %make-condition-object
-  :superclass-name t
-  :metaclass-name condition-classoid
-  :metaclass-constructor make-condition-classoid
-  :dd-type structure)
-
 (defstruct (condition-slot (:copier nil))
   (name (missing-arg) :type symbol)
   ;; list of all applicable initargs
@@ -86,30 +44,12 @@
 ;;; figured out whether it's right. -- WHN 19990612
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (/show0 "condition.lisp 103")
-  (let ((condition-class (locally
-                           ;; KLUDGE: There's a DEFTRANSFORM
-                           ;; FIND-CLASSOID for constant class names
-                           ;; which creates fast but
-                           ;; non-cold-loadable, non-compact code. In
-                           ;; this context, we'd rather have compact,
-                           ;; cold-loadable code. -- WHN 19990928
-                           (declare (notinline find-classoid))
-                           (find-classoid 'condition))))
+  (let ((condition-class (find-classoid 'condition)))
     (setf (condition-classoid-cpl condition-class)
           (list condition-class)))
   (/show0 "condition.lisp 103"))
 
-(setf (condition-classoid-report (locally
-                                   ;; KLUDGE: There's a DEFTRANSFORM
-                                   ;; FIND-CLASSOID for constant class
-                                   ;; names which creates fast but
-                                   ;; non-cold-loadable, non-compact
-                                   ;; code. In this context, we'd
-                                   ;; rather have compact,
-                                   ;; cold-loadable code. -- WHN
-                                   ;; 19990928
-                                   (declare (notinline find-classoid))
-                                   (find-classoid 'condition)))
+(setf (condition-classoid-report (find-classoid 'condition))
       (lambda (cond stream)
         (format stream "Condition ~S was signalled." (type-of cond))))
 
@@ -236,119 +176,58 @@
 
 ;;;; MAKE-CONDITION
 
-(defun allocate-condition (type &rest initargs)
-  (let* ((classoid (if (symbolp type)
-                       (find-classoid type nil)
-                       type))
-         (class (typecase classoid
-                  (condition-classoid classoid)
-                  (class
-                   (return-from allocate-condition
-                     (apply #'allocate-condition (class-name classoid) initargs)))
-                  (classoid
-                   (error 'simple-type-error
-                          :datum classoid
-                          :expected-type 'condition-class
-                          :format-control "~S is not a condition class."
-                          :format-arguments (list type)))
-                  (t
-                   (error 'simple-type-error
-                          :datum type
-                          :expected-type 'condition-class
-                          :format-control
-                          "~S does not designate a condition class."
-                          :format-arguments (list type)))))
-         (condition (%make-condition-object initargs '())))
-    (setf (%instance-layout condition) (classoid-layout class))
-    (values condition class)))
+(defun allocate-condition (designator &rest initargs)
+  ;; I am going to assume that people are not somehow getting to here
+  ;; with a CLASSOID, which is not strictly legal as a designator,
+  ;; but which is accepted because it is actually the desired thing.
+  ;; It doesn't seem worth sweating over that detail, and in any event
+  ;; we could say that it's a supported extension.
+  (let ((classoid (named-let lookup ((designator designator))
+                    (typecase designator
+                     (symbol (find-classoid designator nil))
+                     (class (lookup (class-name designator)))
+                     (t designator)))))
+    (if (condition-classoid-p classoid)
+        (let ((instance (%make-condition-object initargs '())))
+          (setf (%instance-layout instance) (classoid-layout classoid))
+          (values instance classoid))
+        (error 'simple-type-error
+               :datum designator
+               ;; CONDITION-CLASS isn't a type-specifier. Is this legal?
+               :expected-type 'condition-class
+               :format-control "~S does not designate a condition class."
+               :format-arguments (list designator)))))
 
 (defun make-condition (type &rest initargs)
   #!+sb-doc
   "Make an instance of a condition object using the specified initargs."
-  ;; Note: ANSI specifies no exceptional situations in this function.
-  ;; signalling simple-type-error would not be wrong.
-  (multiple-value-bind (condition class)
+  ;; Note: While ANSI specifies no exceptional situations in this function,
+  ;; ALLOCATE-CONDITION will signal a type error if TYPE does not designate
+  ;; a condition class. This seems fair enough.
+  (multiple-value-bind (condition classoid)
       (apply #'allocate-condition type initargs)
 
     ;; Set any class slots with initargs present in this call.
-    (dolist (cslot (condition-classoid-class-slots class))
+    (dolist (cslot (condition-classoid-class-slots classoid))
       (dolist (initarg (condition-slot-initargs cslot))
         (let ((val (getf initargs initarg *empty-condition-slot*)))
           (unless (eq val *empty-condition-slot*)
             (setf (car (condition-slot-cell cslot)) val)))))
 
     ;; Default any slots with non-constant defaults now.
-    (dolist (hslot (condition-classoid-hairy-slots class))
+    (dolist (hslot (condition-classoid-hairy-slots classoid))
       (when (dolist (initarg (condition-slot-initargs hslot) t)
               (unless (eq (getf initargs initarg *empty-condition-slot*)
                           *empty-condition-slot*)
                 (return nil)))
         (setf (getf (condition-assigned-slots condition)
                     (condition-slot-name hslot))
-              (find-slot-default class hslot))))
+              (find-slot-default classoid hslot))))
 
     condition))
 
 
 ;;;; DEFINE-CONDITION
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-(defun %compiler-define-condition (name direct-supers layout
-                                   all-readers all-writers)
-  (with-single-package-locked-error
-      (:symbol name "defining ~A as a condition")
-    (sb!xc:proclaim `(ftype (function (t) t) ,@all-readers))
-    (sb!xc:proclaim `(ftype (function (t t) t) ,@all-writers))
-    (multiple-value-bind (class old-layout)
-        (insured-find-classoid name
-                               #'condition-classoid-p
-                               #'make-condition-classoid)
-      (setf (layout-classoid layout) class)
-      (setf (classoid-direct-superclasses class)
-            (mapcar #'find-classoid direct-supers))
-      (cond ((not old-layout)
-             (register-layout layout))
-            ((not *type-system-initialized*)
-             (setf (layout-classoid old-layout) class)
-             (setq layout old-layout)
-             (unless (eq (classoid-layout class) layout)
-               (register-layout layout)))
-            ((redefine-layout-warning "current"
-                                      old-layout
-                                      "new"
-                                      (layout-length layout)
-                                      (layout-inherits layout)
-                                      (layout-depthoid layout)
-                                      (layout-raw-slot-metadata layout))
-             (register-layout layout :invalidate t))
-            ((not (classoid-layout class))
-             (register-layout layout)))
-
-      ;; This looks totally bogus - it essentially means that the LAYOUT-INFO
-      ;; of a condition is good for nothing, because it describes something
-      ;; that is not the condition class being defined.
-      ;; In addition to which, the INFO for CONDITION itself describes
-      ;; slots which do not exist, viz:
-      ;;  (dd-slots (layout-info (classoid-layout (find-classoid 'condition))))
-      ;; => (#<DEFSTRUCT-SLOT-DESCRIPTION ACTUAL-INITARGS>
-      ;;     #<DEFSTRUCT-SLOT-DESCRIPTION ASSIGNED-SLOTS>)
-      (setf (layout-info layout)
-            (locally
-                ;; KLUDGE: There's a FIND-CLASS DEFTRANSFORM for constant class
-                ;; names which creates fast but non-cold-loadable, non-compact
-                ;; code. In this context, we'd rather have compact, cold-loadable
-                ;; code. -- WHN 19990928
-                (declare (notinline find-classoid))
-              (layout-info (classoid-layout (find-classoid 'condition)))))
-
-      (setf (find-classoid name) class)
-
-      ;; Initialize CPL slot.
-      (setf (condition-classoid-cpl class)
-            (remove-if-not #'condition-classoid-p
-                           (std-compute-class-precedence-list class)))))
-  (values))
-) ; EVAL-WHEN
 
 ;;; Compute the effective slots of CLASS, copying inherited slots and
 ;;; destructively modifying direct slots.
@@ -407,9 +286,9 @@
   (setf (condition-classoid-report (find-classoid name))
         report))
 
-(defun %define-condition (name parent-types layout slots documentation
+(defun %define-condition (name parent-types layout slots
                           direct-default-initargs all-readers all-writers
-                          source-location)
+                          source-location &optional documentation)
   (with-single-package-locked-error
       (:symbol name "defining ~A as a condition")
     (%compiler-define-condition name parent-types layout all-readers all-writers)
@@ -555,12 +434,11 @@
           (:report
            (let ((arg (second option)))
              (setq report
-                   (if (stringp arg)
-                       `#'(lambda (condition stream)
-                            (declare (ignore condition))
-                            (write-string ,arg stream))
-                       `#'(lambda (condition stream)
-                            (funcall #',arg condition stream))))))
+                   `#'(named-lambda (condition-report ,name) (condition stream)
+                        ,@(if (stringp arg)
+                              `((declare (ignore condition))
+                                (write-string ,arg stream))
+                              `((funcall #',arg condition stream)))))))
           (:default-initargs
            (doplist (initarg initform) (rest option)
              (push ``(,',initarg ,',initform ,#'(lambda () ,initform))
@@ -576,11 +454,12 @@
                             ',parent-types
                             ',layout
                             (list ,@(slots))
-                            ,documentation
                             (list ,@direct-default-initargs)
                             ',(all-readers)
                             ',(all-writers)
-                            (sb!c:source-location))
+                            (sb!c:source-location)
+                            ,@(and documentation
+                                   `(,documentation)))
          ;; This needs to be after %DEFINE-CONDITION in case :REPORT
          ;; is a lambda referring to condition slot accessors:
          ;; they're not proclaimed as functions before it has run if
@@ -1232,7 +1111,7 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
      (let ((error-stream (stream-error-stream condition)))
        (format stream
                "READER-ERROR ~@[at ~W ~]on ~S:~%~?~%Original error: ~A"
-               (file-position-or-nil-for-error error-stream) error-stream
+               (sb!impl::file-position-or-nil-for-error error-stream) error-stream
                (simple-condition-format-control condition)
                (simple-condition-format-arguments condition)
                (reader-impossible-number-error-error condition))))))
@@ -1443,6 +1322,8 @@ handled by any other handler, it will be muffled.")
                 (not new-namestring)
                 (not (string= old-namestring new-namestring))))))))
 
+(setf (info :function :predicate-truth-constraint
+            'uninteresting-ordinary-function-redefinition-p) 'warning)
 (defun uninteresting-ordinary-function-redefinition-p (warning)
   (and
    (typep warning 'redefinition-with-defun)
@@ -1451,6 +1332,8 @@ handled by any other handler, it will be muffled.")
      (not (interesting-function-redefinition-warning-p
            warning (or (fdefinition name) (macro-function name)))))))
 
+(setf (info :function :predicate-truth-constraint
+            'uninteresting-macro-redefinition-p) 'warning)
 (defun uninteresting-macro-redefinition-p (warning)
   (and
    (typep warning 'redefinition-with-defmacro)
@@ -1459,6 +1342,8 @@ handled by any other handler, it will be muffled.")
      (not (interesting-function-redefinition-warning-p
            warning (or (macro-function name) (fdefinition name)))))))
 
+(setf (info :function :predicate-truth-constraint
+            'uninteresting-generic-function-redefinition-p) 'warning)
 (defun uninteresting-generic-function-redefinition-p (warning)
   (and
    (typep warning 'redefinition-with-defgeneric)
@@ -1477,6 +1362,8 @@ handled by any other handler, it will be muffled.")
           new-namestring
           (string= old-namestring new-namestring)))))
 
+(setf (info :function :predicate-truth-constraint
+            'uninteresting-method-redefinition-p) 'warning)
 (defun uninteresting-method-redefinition-p (warning)
   (and
    (typep warning 'redefinition-with-defmethod)
@@ -1643,18 +1530,40 @@ the usual naming convention (names like *FOO*) for special variables"
 
 ;;;; deprecation conditions
 
-(define-condition deprecation-condition ()
-  ((name :initarg :name :reader deprecated-name)
-   (replacements :initarg :replacements :reader deprecated-name-replacements)
-   (since :initarg :since :reader deprecated-since)
-   (runtime-error :initarg :runtime-error :reader deprecated-name-runtime-error)))
+(define-condition deprecation-condition (reference-condition)
+  ((namespace     :initarg :namespace
+                  :reader deprecation-condition-namespace)
+   (name          :initarg :name
+                  :reader deprecation-condition-name)
+   (replacements  :initarg :replacements
+                  :reader deprecation-condition-replacements)
+   (software      :initarg :software
+                  :reader deprecation-condition-software)
+   (version       :initarg :version
+                  :reader deprecation-condition-version)
+   (runtime-error :initarg :runtime-error
+                  :reader deprecation-condition-runtime-error
+                  :initform nil))
+  (:default-initargs
+   :namespace (missing-arg)
+   :name (missing-arg)
+   :replacements (missing-arg)
+   :software (missing-arg)
+   :version (missing-arg)
+   :references '((:sbcl :node "Deprecation Conditions")))
+  #!+sb-doc
+  (:documentation
+   "Superclass for deprecation-related error and warning
+conditions."))
 
 (def!method print-object ((condition deprecation-condition) stream)
   (flet ((print-it (stream)
-           (sb!impl::print-deprecation-message
-            (deprecated-name condition)
-            (deprecated-since condition)
-            (deprecated-name-replacements condition)
+           (print-deprecation-message
+            (deprecation-condition-namespace condition)
+            (deprecation-condition-name condition)
+            (deprecation-condition-software condition)
+            (deprecation-condition-version condition)
+            (deprecation-condition-replacements condition)
             stream)))
     (if *print-escape*
         (print-unreadable-object (condition stream :type t)
@@ -1662,47 +1571,60 @@ the usual naming convention (names like *FOO*) for special variables"
         (print-it stream))))
 
 (macrolet ((define-deprecation-warning
-               (name superclass check-runtime-error format-string)
+               (name superclass check-runtime-error format-string
+                &optional documentation)
              `(progn
-                (define-condition ,name (,superclass deprecation-condition) ())
+                (define-condition ,name (,superclass deprecation-condition)
+                  ()
+                  ,@(when documentation
+                      `((:documentation ,documentation))))
 
                 (def!method print-object :after ((condition ,name) stream)
                   (when (and (not *print-escape*)
                              ,@(when check-runtime-error
-                                `((deprecated-name-runtime-error condition))))
+                                `((deprecation-condition-runtime-error condition))))
                     (format stream ,format-string
-                            (deprecated-name condition)))))))
+                            (deprecation-condition-software condition)
+                            (deprecation-condition-name condition)))))))
 
   (define-deprecation-warning early-deprecation-warning style-warning nil
-    #+sb-xc-host
-    "~%~@<~:@_In future SBCL versions ~
-     ~/sb!impl:print-symbol-with-prefix/ will signal a full warning ~
-     at compile-time.~:@>"
-    #-sb-xc-host
-    "~%~@<~:@_In future SBCL versions ~
-     ~/sb-impl:print-symbol-with-prefix/ will signal a full warning ~
-     at compile-time.~:@>")
+    (!uncross-format-control
+     "~%~@<~:@_In future ~A versions ~
+      ~/sb!impl:print-symbol-with-prefix/ will signal a full warning ~
+      at compile-time.~:@>")
+    #!+sb-doc
+    "This warning is signaled when the use of a variable,
+function, type, etc. in :EARLY deprecation is detected at
+compile-time. The use will work at run-time with no warning or
+error.")
 
   (define-deprecation-warning late-deprecation-warning warning t
-    #+sb-xc-host
-    "~%~@<~:@_In future SBCL versions ~
-     ~/sb!impl:print-symbol-with-prefix/ will signal a runtime ~
-     error.~:@>"
-    #-sb-xc-host
-    "~%~@<~:@_In future SBCL versions ~
-     ~/sb-impl:print-symbol-with-prefix/ will signal a runtime ~
-     error.~:@>")
+    (!uncross-format-control
+     "~%~@<~:@_In future ~A versions ~
+      ~/sb!impl:print-symbol-with-prefix/ will signal a runtime ~
+      error.~:@>")
+    #!+sb-doc
+    "This warning is signaled when the use of a variable,
+function, type, etc. in :LATE deprecation is detected at
+compile-time. The use will work at run-time with no warning or
+error.")
 
   (define-deprecation-warning final-deprecation-warning warning t
-    #+sb-xc-host
-    "~%~@<~:@_An error will be signaled at runtime for ~
-     ~/sb!impl:print-symbol-with-prefix/.~:@>"
-    #-sb-xc-host
-    "~%~@<~:@_An error will be signaled at runtime for ~
-     ~/sb-impl:print-symbol-with-prefix/.~:@>"))
+    (!uncross-format-control
+     "~%~@<~:@_~*An error will be signaled at runtime for ~
+      ~/sb!impl:print-symbol-with-prefix/.~:@>")
+    #!+sb-doc
+    "This warning is signaled when the use of a variable,
+function, type, etc. in :FINAL deprecation is detected at
+compile-time. An error will be signaled at run-time."))
 
 (define-condition deprecation-error (error deprecation-condition)
-  ())
+  ()
+  #!+sb-doc
+  (:documentation
+   "This error is signaled at run-time when an attempt is made to use
+a thing that is in :FINAL deprecation, i.e. call a function or access
+a variable."))
 
 ;;;; restart definitions
 

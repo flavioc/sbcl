@@ -11,10 +11,6 @@
 
 (in-package "SB!THREAD")
 
-(defun make-mutex (&key name value)
-  (declare (ignore name value))
-  nil)
-
 (defmacro with-mutex ((mutex) &body body)
   (declare (ignore mutex))
   `(locally ,@body))
@@ -26,3 +22,5 @@
 (defmacro barrier ((kind) &body body)
   (declare (ignore kind))
   `(progn ,@body))
+
+(defun thread-yield () nil)

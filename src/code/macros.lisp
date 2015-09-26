@@ -176,47 +176,24 @@ invoked. In that case it will store into PLACE and start over."
     (error 'simple-program-error
            :format-control "cannot define a compiler-macro for a special operator: ~S"
            :format-arguments (list name)))
-  (with-unique-names (whole environment)
-    (multiple-value-bind (body local-decs doc)
-        (parse-defmacro lambda-list whole body name 'define-compiler-macro
-                        :environment environment)
-      (let ((def `(lambda (,whole ,environment)
-                    ,@(sb!c:macro-policy-decls t)
-                    ,@local-decs
-                    ,body))
-            (debug-name (sb!c::debug-name 'compiler-macro-function name)))
-        `(progn
+  ;; DEBUG-NAME is called primarily for its side-effect of asserting
+  ;; that (COMPILER-MACRO-FUNCTION x) is not a legal function name.
+  (let ((def (make-macro-lambda (sb!c::debug-name 'compiler-macro name)
+                                lambda-list body 'define-compiler-macro name
+                                :accessor 'sb!c::compiler-macro-args)))
+    `(progn
           (eval-when (:compile-toplevel)
            (sb!c::%compiler-defmacro :compiler-macro-function ',name t))
           (eval-when (:compile-toplevel :load-toplevel :execute)
-           (sb!c::%define-compiler-macro ',name
-                                         #',def
-                                         ',lambda-list
-                                         ,doc
-                                         ',debug-name)))))))
+           (sb!c::%define-compiler-macro ',name ,def)))))
 
-;;; FIXME: This will look remarkably similar to those who have already
-;;; seen the code for %DEFMACRO in src/code/defmacro.lisp.  Various
-;;; bits of logic should be shared (notably arglist setting).
-(macrolet
-    ((def (times set-p)
-         `(eval-when (,@times)
-           (defun sb!c::%define-compiler-macro
-               (name definition lambda-list doc debug-name)
-             ,@(unless set-p
-                 '((declare (ignore lambda-list doc debug-name))))
-             (sb!c::warn-if-compiler-macro-dependency-problem name)
-             ;; FIXME: warn about incompatible lambda list with
-             ;; respect to parent function?
-             (setf (sb!xc:compiler-macro-function name) definition)
-             ,(when set-p
-                    `(setf (%fun-doc definition) doc
-                           (%fun-lambda-list definition) lambda-list
-                           (%fun-name definition) debug-name))
-             name))))
-  (progn
-    (def (:load-toplevel :execute) #-sb-xc-host t #+sb-xc-host nil)
-    #-sb-xc (def (:compile-toplevel) nil)))
+(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+  (defun sb!c::%define-compiler-macro (name definition)
+    (sb!c::warn-if-compiler-macro-dependency-problem name)
+    ;; FIXME: warn about incompatible lambda list with
+    ;; respect to parent function?
+    (setf (sb!xc:compiler-macro-function name) definition)
+    name))
 
 ;;;; CASE, TYPECASE, and friends
 
@@ -268,9 +245,10 @@ invoked. In that case it will store into PLACE and start over."
                      for existing = (gethash k keys-seen)
                      do (when existing
                           (let ((sb!c::*current-path*
-                                 (when (boundp 'sb!c::*source-paths*)
-                                   (or (sb!c::get-source-path case)
-                                       sb!c::*current-path*))))
+                                  (when (boundp 'sb!c::*source-paths*)
+                                    (or (sb!c::get-source-path case)
+                                        (and (boundp 'sb!c::*current-path*)
+                                             sb!c::*current-path*)))))
                             (warn 'duplicate-case-key-warning
                                   :key k
                                   :case-kind name

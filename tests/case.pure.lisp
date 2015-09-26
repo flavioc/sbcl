@@ -45,9 +45,13 @@
                           (error "~S shouldn't give a warning, but did: ~A" form c))
                         (setf expected nil))))
           (compile nil form))
+      (declare (ignore warnings-p))
       (assert (functionp fun))
       (assert (null expected)
               ()
               "~S should have warned ~S, but didn't."
               form expected)
       (assert (not failure-p))))
+
+(with-test (:name :duplicate-cases-load)
+  (assert (load "case-test.lisp")))

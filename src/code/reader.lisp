@@ -116,7 +116,7 @@
       function
       (cond ((functionp x) x)
             ((null x) ,fallback)
-            (t (values (sb!sys:%primitive sb!c:safe-fdefn-fun x)))))))
+            (t (sb!c:safe-fdefn-fun x))))))
 
 ;; Return a function-designator given a character-macro-table entry.
 (defmacro !cmt-entry-to-fun-designator (val)
@@ -1512,10 +1512,10 @@ extended <package-name>::<form-in-package> syntax."
                      (reader-find-package package-designator stream)
                      (or *reader-package* (sane-package)))))
         (if (or (zerop colons) (= colons 2) (eq pkg *keyword-package*))
-            (return (intern* (token-buf-string buf) (token-buf-fill-ptr buf)
-                             pkg))
+            (return (%intern (token-buf-string buf) (token-buf-fill-ptr buf)
+                             pkg t))
             (multiple-value-bind (symbol accessibility)
-                (find-symbol* (token-buf-string buf) (token-buf-fill-ptr buf)
+                (%find-symbol (token-buf-string buf) (token-buf-fill-ptr buf)
                               pkg)
               (when (eq accessibility :external) (return symbol))
               (let ((name (copy-token-buf-string buf)))

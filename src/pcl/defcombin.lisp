@@ -23,6 +23,10 @@
 
 (in-package "SB-PCL")
 
+;;; FIXME: according to ANSI 3.4.10 this is supposed to allow &WHOLE
+;;; in the long syntax. But it clearly does not, because if you write
+;;; (&WHOLE v) then you get (LAMBDA (&WHOLE V ...) ...) which is illegal
+;;;
 (defmacro define-method-combination (&whole form &rest args)
   (declare (ignore args))
   `(progn
@@ -432,7 +436,7 @@
 ;;; option are bound to the symbols in the intercept lambda list.
 ;;;
 ;;; FIXME: in here we have not one but two mini-copies of a weird
-;;; hybrid of PARSE-LAMBDA-LIST and PARSE-DEFMACRO-LAMBDA-LIST.
+;;; hybrid of PARSE-LAMBDA-LIST and (obsolete) PARSE-DEFMACRO-LAMBDA-LIST.
 (defun deal-with-args-option (wrapped-body args-lambda-list)
   (let ((intercept-rebindings
          (let (rebindings)

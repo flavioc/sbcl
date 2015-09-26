@@ -72,6 +72,11 @@ Example:
           ,new))))
 
 EXPERIMENTAL: Interface subject to change."
+  ;; FIXME: this seems wrong on two points:
+  ;; 1. if TRULY-THE had a CAS expander (which it doesn't) we'd want
+  ;;    to use %MACROEXPAND[-1] so as not to lose the "truly-the"-ness
+  ;; 2. if both a CAS expander and a macro exist, the CAS expander
+  ;;    should be preferred before macroexpanding (just like SETF does)
     (let ((expanded (sb!xc:macroexpand place environment)))
       (flet ((invalid-place ()
            (error "Invalid place to CAS: ~S -> ~S" place expanded)))
@@ -147,21 +152,19 @@ can it verify that they are atomic: it is up to the implementor of a CAS
 expansion to ensure its atomicity.
 
 EXPERIMENTAL: Interface subject to change."
-  (with-unique-names (whole environment)
-    (multiple-value-bind (body decls doc)
-        (parse-defmacro lambda-list whole body accessor
-                        'define-cas-expander
-                        :environment environment
-                        :wrap-block nil)
-      `(eval-when (:compile-toplevel :load-toplevel :execute)
-         (setf (info :cas :expander ',accessor)
-               (lambda (,whole ,environment)
-                 ,@(when doc (list doc))
-                 ,@decls
-                 ,body))))))
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     (setf (info :cas :expander ',accessor)
+           ,(make-macro-lambda `(cas-expand ,accessor) lambda-list body
+                               'define-cas-expander accessor))))
 
-(def!macro defcas (&whole form accessor lambda-list function
-                  &optional docstring)
+;; FIXME: this interface is bogus - short-form DEFSETF/CAS does not
+;; want a lambda-list. You just blindly substitute
+;;  (CAS (PLACE arg1 ... argN) old new) -> (F arg1 ... argN old new).
+;; What role can this lambda-list have when there is no user-provided
+;; code to read the variables?
+;; And as mentioned no sbcl-devel, &REST is beyond bogus, it's broken.
+;;
+(def!macro defcas (accessor lambda-list function &optional docstring)
   #!+sb-doc
   "Analogous to short-form DEFSETF. Defines FUNCTION as responsible
 for compare-and-swap on places accessed using ACCESSOR. LAMBDA-LIST
@@ -172,20 +175,16 @@ resulting from DEFCAS, nor can it verify that they are atomic: it is up to the
 user of DEFCAS to ensure that the function specified is atomic.
 
 EXPERIMENTAL: Interface subject to change."
-  (multiple-value-bind (reqs opts restp rest keyp keys allowp auxp)
-      (parse-lambda-list lambda-list)
-    (declare (ignore keys))
-    (when (or keyp allowp auxp)
-      (error "&KEY, &AUX, and &ALLOW-OTHER-KEYS not allowed in DEFCAS ~
-              lambda-list.~%  ~S" form))
+  (multiple-value-bind (llks reqs opts rest)
+      (parse-lambda-list lambda-list
+                         :accept (lambda-list-keyword-mask '(&optional &rest))
+                         :context "a DEFCAS lambda-list")
+    (declare (ignore llks))
     `(define-cas-expander ,accessor ,lambda-list
        ,@(when docstring (list docstring))
-       (let ((temps (mapcar #'gensymify
-                            ',(append reqs opts
-                                      (when restp (list (gensymify rest))))))
-             (args (list ,@(append reqs
-                                   opts
-                                   (when restp (list rest)))))
+       ;; FIXME: if a &REST arg is present, this is really weird.
+       (let ((temps (mapcar #'gensymify ',(append reqs opts rest)))
+             (args (list ,@(append reqs opts rest)))
              (old (gensym "OLD"))
              (new (gensym "NEW")))
          (values temps

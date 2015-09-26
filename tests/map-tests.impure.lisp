@@ -191,4 +191,60 @@
                           '(1 2 3))
                  #(1 2 3))))
 
-;;; success
+(with-test (:name :map-into-type-mismatch)
+  (assert-error
+   (funcall
+    (compile nil
+             `(lambda (x)
+                (map-into (make-array 1 :element-type '(signed-byte 16)) x)))
+    (constantly nil))
+   type-error)
+  (assert-error
+   (funcall
+    (compile nil
+             `(lambda (array x)
+                (map-into array x)))
+    (make-array 1 :element-type '(signed-byte 16)) (constantly nil))
+   type-error)
+  (assert-error
+   (funcall
+    (compile nil
+             `(lambda (array x)
+                (map-into array x)))
+    (cons 1 2) (constantly nil))
+   type-error))
+
+(with-test (:name :map-type-mismatch)
+  (assert-error
+   (funcall
+    (compile nil
+             `(lambda (x) (map '(vector (signed-byte 16) 1) #'identity x)))
+    '(1.0))
+   type-error)
+  (assert-error
+   (funcall
+    (compile nil
+             `(lambda (type x) (map type #'identity x)))
+    '(vector (signed-byte 16) 1) '(1.0))
+   type-error))
+
+(with-test (:name :map-out-of-line)
+  (flet ((call (map &rest args)
+           (apply (compile nil `(lambda (&rest args)
+                                  (declare (notinline ,map))
+                                  (apply #',map args)))
+                  args)))
+    (assert (equal (call 'mapcar #'+ '(1 2 3) '(3 2 1))
+                   '(4 4 4)))
+    (assert (equal (call 'maplist #'cons '(1 2 3) '(3 2 1))
+                   '(((1 2 3) 3 2 1) ((2 3) 2 1) ((3) 1))))
+    (assert (equal (call 'mapcan #'cons '(1 2 3) '(3 2 1))
+                   '(1 2 3 . 1)))
+    (assert (equal (call 'mapcon #'list '(1 2 3) '(3 2 1))
+                   '((1 2 3) (3 2 1) (2 3) (2 1) (3) (1))))
+    (assert (equal (call 'mapcan #'identity
+                         '((3 4 . 5) nil (1 . 5)))
+                   '(3 4 1 . 5)))
+    (assert (equal (call 'mapcar #'list '(1 2 3) '(4 5 6) '(7 8 9))
+                   '((1 4 7) (2 5 8) (3 6 9))))
+    (assert (equal (call 'mapcan #'identity '(1)) 1))))

@@ -326,7 +326,7 @@ terminating the main thread would terminate the entire process. If
 ALLOW-EXIT is true, aborting the main thread is equivalent to calling
 SB-EXT:EXIT code 1 and :ABORT NIL.
 
-Invoking the initial ABORT restart estabilished by MAKE-THREAD is
+Invoking the initial ABORT restart established by MAKE-THREAD is
 equivalent to calling ABORT-THREAD in other than main threads.
 However, whereas ABORT restart may be rebound, ABORT-THREAD always
 unwinds the entire thread. (Behaviour of the initial ABORT restart for
@@ -1069,23 +1069,18 @@ WAIT-ON-SEMAPHORE or TRY-SEMAPHORE."
   (barrier (:read))
   (semaphore-%count instance))
 
-(defun wait-on-semaphore (semaphore &key timeout notification)
-  #!+sb-doc
-  "Decrement the count of SEMAPHORE if the count would not be negative. Else
-blocks until the semaphore can be decremented. Returns T on success.
-
-If TIMEOUT is given, it is the maximum number of seconds to wait. If the count
-cannot be decremented in that time, returns NIL without decrementing the
-count.
-
-If NOTIFICATION is given, it must be a SEMAPHORE-NOTIFICATION object whose
-SEMAPHORE-NOTIFICATION-STATUS is NIL. If WAIT-ON-SEMAPHORE succeeds and
-decrements the count, the status is set to T."
+(declaim (ftype (sfunction (semaphore (integer 1) (or boolean real)
+                            (or null semaphore-notification) symbol)
+                           t)
+                %decrement-semaphore))
+(defun %decrement-semaphore (semaphore n wait notification context)
   (when (and notification (semaphore-notification-status notification))
     (with-simple-restart (continue "Clear notification status and continue.")
-      (error "~@<Semaphore notification object status not cleared on entry to ~S on ~S.~:@>"
-             'wait-on-semaphore semaphore))
+      (error "~@<Semaphore notification object status not cleared on ~
+              entry to ~S on ~S.~:@>"
+             context semaphore))
     (clear-semaphore-notification notification))
+
   ;; A more direct implementation based directly on futexes should be
   ;; possible.
   ;;
@@ -1095,57 +1090,77 @@ decrements the count, the status is set to T."
   ;;
   ;; FIXME: No timeout on initial mutex acquisition.
   (with-system-mutex ((semaphore-mutex semaphore) :allow-with-interrupts t)
-    ;; Quick check: is it positive? If not, enter the wait loop.
-    (let ((count (semaphore-%count semaphore)))
-      (cond ((plusp count)
-             (setf (semaphore-%count semaphore) (1- count))
-             (when notification
-               (setf (semaphore-notification-%status notification) t)))
-            (t
-             (unwind-protect
-                  (progn
-                    ;; Need to use ATOMIC-INCF despite the lock, because on our
-                    ;; way out from here we might not be locked anymore -- so
-                    ;; another thread might be tweaking this in parallel using
-                    ;; ATOMIC-DECF. No danger over overflow, since there it
-                    ;; at most one increment per thread waiting on the semaphore.
-                    (sb!ext:atomic-incf (semaphore-waitcount semaphore))
-                    (loop until (plusp (setf count (semaphore-%count semaphore)))
-                          do (or (condition-wait (semaphore-queue semaphore)
-                                                 (semaphore-mutex semaphore)
-                                                 :timeout timeout)
-                                 (return-from wait-on-semaphore nil)))
-                    (setf (semaphore-%count semaphore) (1- count))
-                    (when notification
-                      (setf (semaphore-notification-%status notification) t)))
-               ;; Need to use ATOMIC-DECF as we may unwind without the lock
-               ;; being held!
-               (sb!ext:atomic-decf (semaphore-waitcount semaphore)))))))
-  t)
+    (flet ((success (new-count)
+             (prog1
+                 (setf (semaphore-%count semaphore) new-count)
+               (when notification
+                 (setf (semaphore-notification-%status notification) t)))))
+      ;; Quick check: can we decrement right away? If not, return or
+      ;; enter the wait loop.
+      (cond
+        ((let ((old-count (semaphore-%count semaphore)))
+           (when (>= old-count n)
+             (success (- old-count n)))))
+        ((not wait)
+         nil)
+        (t
+         (unwind-protect
+              (let (old-count
+                    (timeout (when (realp wait) wait)))
+                ;; Need to use ATOMIC-INCF despite the lock, because
+                ;; on our way out from here we might not be locked
+                ;; anymore -- so another thread might be tweaking this
+                ;; in parallel using ATOMIC-DECF. No danger over
+                ;; overflow, since there it at most one increment per
+                ;; thread waiting on the semaphore.
+                (sb!ext:atomic-incf (semaphore-waitcount semaphore))
+                (loop until (>= (setf old-count (semaphore-%count semaphore)) n)
+                   do (or (condition-wait (semaphore-queue semaphore)
+                                          (semaphore-mutex semaphore)
+                                          :timeout timeout)
+                          (return-from %decrement-semaphore nil)))
+                (success (- old-count n)))
+           ;; Need to use ATOMIC-DECF as we may unwind without the
+           ;; lock being held!
+           (sb!ext:atomic-decf (semaphore-waitcount semaphore))))))))
 
+(declaim (ftype (sfunction (semaphore &key
+                                      (:n (integer 1))
+                                      (:timeout (real (0)))
+                                      (:notification semaphore-notification))
+                           (or null (integer 0)))
+                wait-on-semaphore))
+(defun wait-on-semaphore (semaphore &key (n 1) timeout notification)
+  #!+sb-doc
+  "Decrement the count of SEMAPHORE by N if the count would not be negative.
+
+Else blocks until the semaphore can be decremented. Returns the new count of
+SEMAPHORE on success.
+
+If TIMEOUT is given, it is the maximum number of seconds to wait. If the count
+cannot be decremented in that time, returns NIL without decrementing the
+count.
+
+If NOTIFICATION is given, it must be a SEMAPHORE-NOTIFICATION object whose
+SEMAPHORE-NOTIFICATION-STATUS is NIL. If WAIT-ON-SEMAPHORE succeeds and
+decrements the count, the status is set to T."
+  (%decrement-semaphore
+   semaphore n (or timeout t) notification 'wait-on-semaphore))
+
+(declaim (ftype (sfunction (semaphore &optional
+                                      (integer 1) semaphore-notification)
+                           (or null (integer 0)))
+                try-semaphore))
 (defun try-semaphore (semaphore &optional (n 1) notification)
   #!+sb-doc
   "Try to decrement the count of SEMAPHORE by N. If the count were to
-become negative, punt and return NIL, otherwise return true.
+become negative, punt and return NIL, otherwise return the new count of
+SEMAPHORE.
 
 If NOTIFICATION is given it must be a semaphore notification object
 with SEMAPHORE-NOTIFICATION-STATUS of NIL. If the count is decremented,
 the status is set to T."
-  (declare (type (integer 1) n))
-  (when (and notification (semaphore-notification-status notification))
-    (with-simple-restart (continue "Clear notification status and continue.")
-      (error "~@<Semaphore notification object status not cleared on entry to ~S on ~S.~:@>"
-             'try-semaphore semaphore))
-    (clear-semaphore-notification notification))
-  (with-system-mutex ((semaphore-mutex semaphore) :allow-with-interrupts t)
-    (let ((new-count (- (semaphore-%count semaphore) n)))
-      (when (not (minusp new-count))
-        (setf (semaphore-%count semaphore) new-count)
-        (when notification
-          (setf (semaphore-notification-%status notification) t))
-        ;; FIXME: We don't actually document this -- should we just
-        ;; return T, or document new count as the return?
-        new-count))))
+  (%decrement-semaphore semaphore n nil notification 'try-semaphore))
 
 (defun signal-semaphore (semaphore &optional (n 1))
   #!+sb-doc
@@ -1508,9 +1523,7 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
                      make-mutex))
     (let* ((setup-sem (make-semaphore :name "Thread setup semaphore"))
            (real-function (coerce function 'function))
-           (arguments     (if (listp arguments)
-                              arguments
-                              (list arguments)))
+           (arguments     (ensure-list arguments))
            #!+win32
            (fp-modes (dpb 0 sb!vm::float-sticky-bits ;; clear accrued bits
                           (sb!vm:floating-point-modes)))
@@ -1550,8 +1563,15 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
   "Suspend current thread until THREAD exits. Return the result values
 of the thread function.
 
-If the thread does not exit normally within TIMEOUT seconds return
-DEFAULT if given, or else signal JOIN-THREAD-ERROR.
+If the thread does not exit within TIMEOUT seconds and DEFAULT is
+supplied, return two values: 1) DEFAULT 2) :TIMEOUT. If DEFAULT is not
+supplied, signal a JOIN-THREAD-ERROR with JOIN-THREAD-ERROR-PROBLEM
+equal to :TIMEOUT.
+
+If the thread did not exit normally (i.e. aborted) and DEFAULT is
+supplied, return two values: 1) DEFAULT 2) :ABORT. If DEFAULT is not
+supplied, signal a JOIN-THREAD-THREAD-ERROR with problem equal
+to :ABORT.
 
 Trying to join the main thread will cause JOIN-THREAD to block until
 TIMEOUT occurs or the process exits: when main thread exits, the
@@ -1564,27 +1584,31 @@ subject to change."
         (problem :timeout))
     (without-interrupts
       (unwind-protect
-           (if (setf got-it
-                     (allow-with-interrupts
-                       ;; Don't use the timeout if the thread is not alive anymore.
-                       (grab-mutex lock :timeout (and (thread-alive-p thread) timeout))))
-               (cond ((listp (thread-result thread))
-                      (return-from join-thread
-                        (values-list (thread-result thread))))
-                     (defaultp
-                      (return-from join-thread default))
-                     (t
-                      (setf problem :abort)))
-               (when defaultp
-                 (return-from join-thread default)))
+           (cond
+             ((not (setf got-it
+                         (allow-with-interrupts
+                           ;; Don't use the timeout if the thread is
+                           ;; not alive anymore.
+                           (grab-mutex lock :timeout (and (thread-alive-p thread)
+                                                          timeout))))))
+             ((listp (thread-result thread))
+              (return-from join-thread
+                (values-list (thread-result thread))))
+             (t
+              (setf problem :abort)))
         (when got-it
           (release-mutex lock))))
-    (error 'join-thread-error :thread thread :problem problem)))
+    (if defaultp
+        (values default problem)
+        (error 'join-thread-error :thread thread :problem problem))))
 
 (defun destroy-thread (thread)
-  #!+sb-doc
-  "Deprecated. Same as TERMINATE-THREAD."
   (terminate-thread thread))
+
+#-sb-xc-host
+(declaim (sb!ext:deprecated
+          :late ("SBCL" "1.2.15")
+          (function destroy-thread :replacement terminate-thread)))
 
 #!+sb-thread
 (defun enter-foreign-callback (arg1 arg2 arg3)
@@ -1899,11 +1923,10 @@ mechanism for inter-thread communication."
 ;;;; Stepping
 
 (defun thread-stepping ()
-  (make-lisp-obj
-   (sap-ref-word (current-thread-sap)
-                 (* sb!vm::thread-stepping-slot sb!vm:n-word-bytes))))
+  (sap-ref-lispobj (current-thread-sap)
+                   (* sb!vm::thread-stepping-slot sb!vm:n-word-bytes)))
 
 (defun (setf thread-stepping) (value)
-  (setf (sap-ref-word (current-thread-sap)
-                      (* sb!vm::thread-stepping-slot sb!vm:n-word-bytes))
-        (get-lisp-obj-address value)))
+  (setf (sap-ref-lispobj (current-thread-sap)
+                         (* sb!vm::thread-stepping-slot sb!vm:n-word-bytes))
+        value))

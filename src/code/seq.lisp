@@ -347,7 +347,7 @@
   #!+sb-doc
   "Return a sequence of the given TYPE and LENGTH, with elements initialized
   to INITIAL-ELEMENT."
-  (declare (fixnum length))
+  (declare (index length))
   (let* ((expanded-type (typexpand type))
          (adjusted-type
           (typecase expanded-type
@@ -410,11 +410,15 @@
                 (awhen (find-class adjusted-type nil)
                   (let ((prototype (sb!mop:class-prototype
                                     (sb!pcl:ensure-class-finalized it))))
+                   ;; This function is DEFKNOWNed with EXPLICIT-CHECK,
+                   ;; so we must manually assert that user-written methods
+                   ;; return a subtype of SEQUENCE.
+                   (the sequence
                     (if iep
                         (sb!sequence:make-sequence-like
                          prototype length :initial-element initial-element)
                         (sb!sequence:make-sequence-like
-                         prototype length))))))
+                         prototype length)))))))
           (t (bad-sequence-type-error (type-specifier type))))))
 
 ;;;; SUBSEQ
@@ -914,10 +918,14 @@ many elements are copied."
          (concat-to-simple* output-type-spec sequences))
         ((and (csubtypep type (specifier-type 'sequence))
               (awhen (find-class output-type-spec nil)
+               ;; This function is DEFKNOWNed with EXPLICIT-CHECK,
+               ;; so we must manually assert that user-written methods
+               ;; return a subtype of SEQUENCE.
+               (the sequence
                 (apply #'sb!sequence:concatenate
                        (sb!mop:class-prototype
                         (sb!pcl:ensure-class-finalized it))
-                       sequences))))
+                       sequences)))))
         (t
          (bad-sequence-type-error output-type-spec))))))
 
@@ -1008,6 +1016,8 @@ many elements are copied."
                   (setf (car in-apply-args) (aref v i)
                         (car in-iters) (1+ i)))))
            (t
+            ;; While on one hand this could benefit from a zero-safety ds-bind,
+            ;; on the other, why not coerce these tuples to vectors or structs?
             (destructuring-bind (state limit from-end step endp elt &rest ignore)
                 i
               (declare (type function step endp elt)
@@ -1052,10 +1062,17 @@ many elements are copied."
 ;;; %MAP is just MAP without the final just-to-be-sure check that
 ;;; length of the output sequence matches any length specified
 ;;; in RESULT-TYPE.
-(defun %map (result-type function first-sequence &rest more-sequences)
+(defun %map (result-type function &rest sequences)
+  (declare (dynamic-extent sequences))
+  ;; Everything that we end up calling uses %COERCE-TO-CALLABLE
+  ;; on FUNCTION so we don't need to declare it of type CALLABLE here.
+  ;; Additionally all the arity-1 mappers use SEQ-DISPATCH which asserts
+  ;; that the input is a SEQUENCE. Despite SEQ-DISPATCH being "less safe"
+  ;; than SEQ-DISPATCH-CHECKING, both are in fact equally safe, because
+  ;; the ARRAY case (which assumes that all arrays are vectors) utilizes
+  ;; %WITH-ARRAY-DATA/FP which asserts that its input is a vector.
   (labels ((slower-map (type)
-             (let ((really-fun (%coerce-callable-to-fun function))
-                   (sequences (cons first-sequence more-sequences)))
+             (let ((really-fun (%coerce-callable-to-fun function)))
                (cond
                  ((eq type *empty-type*)
                   (%map-for-effect really-fun sequences))
@@ -1065,46 +1082,48 @@ many elements are copied."
                   (%map-to-vector result-type really-fun sequences))
                  ((and (csubtypep type (specifier-type 'sequence))
                        (awhen (find-class result-type nil)
-                         (apply #'sb!sequence:map
-                                (sb!mop:class-prototype
-                                 (sb!pcl:ensure-class-finalized it))
-                                really-fun sequences))))
+                         ;; This function is DEFKNOWNed with EXPLICIT-CHECK,
+                         ;; so we must manually assert that user-written methods
+                         ;; return a subtype of SEQUENCE.
+                         (the sequence
+                              (apply #'sb!sequence:map
+                                     (sb!mop:class-prototype
+                                      (sb!pcl:ensure-class-finalized it))
+                                     really-fun sequences)))))
                  (t
-                  (bad-sequence-type-error result-type)))))
-           (slow-map ()
-             (let ((type (specifier-type result-type)))
-               (cond
-                 (more-sequences
-                  (slower-map type))
-                 ((eq type *empty-type*)
-                  (%map-for-effect-arity-1 function first-sequence))
-                 ((csubtypep type (specifier-type 'list))
-                  (%map-to-list-arity-1 function first-sequence))
-                 ((or (csubtypep type (specifier-type 'simple-vector))
-                      (csubtypep type (specifier-type '(vector t))))
-                  (%map-to-simple-vector-arity-1 function first-sequence))
-                 (t
-                  (slower-map type))))))
+                  (bad-sequence-type-error result-type))))))
     ;; Handle some easy cases faster
-    (cond (more-sequences
-           (slow-map))
-          ((null result-type)
-           (%map-for-effect-arity-1 function first-sequence))
-          ((or (eq result-type 'list)
-               (eq result-type 'cons))
-           (%map-to-list-arity-1 function first-sequence))
-          ((or (eq result-type 'vector)
-               (eq result-type 'simple-vector))
-           (%map-to-simple-vector-arity-1 function first-sequence))
-          (t
-           (slow-map)))))
+    (if (/= (length sequences) 1)
+        (slower-map (specifier-type result-type))
+        (let ((first-sequence (fast-&rest-nth 0 sequences)))
+          (case result-type
+           ((nil)
+            (%map-for-effect-arity-1 function first-sequence))
+           ((list cons)
+            (%map-to-list-arity-1 function first-sequence))
+           ((vector simple-vector)
+            (%map-to-simple-vector-arity-1 function first-sequence))
+           (t
+            (let ((type (specifier-type result-type)))
+              (cond ((eq type *empty-type*)
+                     (%map-for-effect-arity-1 function first-sequence))
+                    ((csubtypep type (specifier-type 'list))
+                     (%map-to-list-arity-1 function first-sequence))
+                    ((csubtypep type (specifier-type '(vector t)))
+                     (%map-to-simple-vector-arity-1 function first-sequence))
+                    (t
+                     (slower-map type))))))))))
 
 (defun map (result-type function first-sequence &rest more-sequences)
-  (apply #'%map
-         result-type
-         function
-         first-sequence
-         more-sequences))
+  (let ((result
+         (apply #'%map result-type function first-sequence more-sequences)))
+    (if (or (eq result-type 'nil) (typep result result-type))
+        result
+        (error 'simple-type-error
+               :format-control "MAP result ~S is not a sequence of type ~S"
+               :datum result
+               :expected-type result-type
+               :format-arguments (list result result-type)))))
 
 ;;;; MAP-INTO
 
@@ -1115,12 +1134,11 @@ many elements are copied."
      ;; Note (MAP-INTO SEQ (LAMBDA () ...)) is a different animal,
      ;; hence the awkward flip between MAP and LOOP.
      (if ,sequences
-         (apply #'map nil #'f ,sequences)
+         (apply #'%map nil #'f ,sequences)
          (loop (f)))))
 
 (define-array-dispatch vector-map-into (data start end fun sequences)
-  (declare (optimize speed (safety 0))
-           (type index start end)
+  (declare (type index start end)
            (type function fun)
            (type list sequences))
   (let ((index start))
@@ -1161,10 +1179,15 @@ many elements are copied."
        (let ((node result-sequence))
          (declare (type list node))
          (map-into-lambda sequences (&rest args)
-           (declare (truly-dynamic-extent args)
-                    (optimize speed (safety 0)))
-           (when (null node)
-             (return-from map-into result-sequence))
+           (declare (truly-dynamic-extent args))
+           (cond ((null node)
+                  (return-from map-into result-sequence))
+                 ((not (listp (cdr node)))
+                  (error 'simple-type-error
+                         :format-control "~a is not a proper list"
+                         :format-arguments (list result-sequence)
+                         :expected-type 'list
+                         :datum result-sequence)))
            (setf (car node) (apply really-fun args))
            (setf node (cdr node)))))
       (sequence
@@ -1180,100 +1203,6 @@ many elements are copied."
            (setf iter (sb!sequence:iterator-step result-sequence
                                                            iter from-end)))))))
   result-sequence)
-
-;;;; quantifiers
-
-;;; We borrow the logic from (MAP NIL ..) to handle iteration over
-;;; arbitrary sequence arguments, both in the full call case and in
-;;; the open code case.
-(macrolet ((defquantifier (name found-test found-result
-                                &key doc (unfound-result (not found-result)))
-             `(progn
-                ;; KLUDGE: It would be really nice if we could simply
-                ;; do something like this
-                ;;  (declaim (inline ,name))
-                ;;  (defun ,name (pred first-seq &rest more-seqs)
-                ;;    ,doc
-                ;;    (flet ((map-me (&rest rest)
-                ;;             (let ((pred-value (apply pred rest)))
-                ;;               (,found-test pred-value
-                ;;                 (return-from ,name
-                ;;                   ,found-result)))))
-                ;;      (declare (inline map-me))
-                ;;      (apply #'map nil #'map-me first-seq more-seqs)
-                ;;      ,unfound-result))
-                ;; but Python doesn't seem to be smart enough about
-                ;; inlining and APPLY to recognize that it can use
-                ;; the DEFTRANSFORM for MAP in the resulting inline
-                ;; expansion. I don't have any appetite for deep
-                ;; compiler hacking right now, so I'll just work
-                ;; around the apparent problem by using a compiler
-                ;; macro instead. -- WHN 20000410
-                (defun ,name (pred first-seq &rest more-seqs)
-                  #!+sb-doc ,doc
-                  (flet ((map-me (&rest rest)
-                           (let ((pred-value (apply pred rest)))
-                             (,found-test pred-value
-                                          (return-from ,name
-                                            ,found-result)))))
-                    (declare (inline map-me))
-                    (apply #'map nil #'map-me first-seq more-seqs)
-                    ,unfound-result))
-                ;; KLUDGE: It would be more obviously correct -- but
-                ;; also significantly messier -- for PRED-VALUE to be
-                ;; a gensym. However, a private symbol really does
-                ;; seem to be good enough; and anyway the really
-                ;; obviously correct solution is to make Python smart
-                ;; enough that we can use an inline function instead
-                ;; of a compiler macro (as above). -- WHN 20000410
-                ;;
-                ;; FIXME: The DEFINE-COMPILER-MACRO here can be
-                ;; important for performance, and it'd be good to have
-                ;; it be visible throughout the compilation of all the
-                ;; target SBCL code. That could be done by defining
-                ;; SB-XC:DEFINE-COMPILER-MACRO and using it here,
-                ;; moving this DEFQUANTIFIER stuff (and perhaps other
-                ;; inline definitions in seq.lisp as well) into a new
-                ;; seq.lisp, and moving remaining target-only stuff
-                ;; from the old seq.lisp into target-seq.lisp.
-                (define-compiler-macro ,name (pred first-seq &rest more-seqs)
-                  (binding* ((elements
-                              (make-gensym-list (1+ (length more-seqs))))
-                             (blockname (sb!xc:gensym "BLOCK"))
-                             (wrapper (sb!xc:gensym "WRAPPER"))
-                             ((bind call)
-                              (funarg-bind/call-forms pred elements)))
-                    `(let ,bind
-                       (block ,blockname
-                         (flet ((,wrapper (,@elements)
-                                  (declare (optimize (sb!c::check-tag-existence 0)))
-                                  (let ((pred-value ,call))
-                                    (,',found-test pred-value
-                                      (return-from ,blockname ,',found-result)))))
-                           (declare (inline ,wrapper)
-                                    (dynamic-extent #',wrapper))
-                           (map nil #',wrapper ,first-seq
-                                ,@more-seqs))
-                         ,',unfound-result)))))))
-  (defquantifier some when pred-value :unfound-result nil :doc
-  "Apply PREDICATE to the 0-indexed elements of the sequences, then
-   possibly to those with index 1, and so on. Return the first
-   non-NIL value encountered, or NIL if the end of any sequence is reached.")
-  (defquantifier every unless nil :doc
-  "Apply PREDICATE to the 0-indexed elements of the sequences, then
-   possibly to those with index 1, and so on. Return NIL as soon
-   as any invocation of PREDICATE returns NIL, or T if every invocation
-   is non-NIL.")
-  (defquantifier notany when nil :doc
-  "Apply PREDICATE to the 0-indexed elements of the sequences, then
-   possibly to those with index 1, and so on. Return NIL as soon
-   as any invocation of PREDICATE returns a non-NIL value, or T if the end
-   of any sequence is reached.")
-  (defquantifier notevery unless t :doc
-  "Apply PREDICATE to 0-indexed elements of the sequences, then
-   possibly to those with index 1, and so on. Return T as soon
-   as any invocation of PREDICATE returns NIL, or NIL if every invocation
-   is non-NIL."))
 
 ;;;; REDUCE
 

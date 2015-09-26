@@ -21,7 +21,8 @@
 ;;; >>> DO NOT ADD A (WITH-TEST) TO THIS. <<< It must stay fopcompilable.
 (let ((a (progn)) ; lp# 1427050
       (b (setq))
-      (b (+ 1 2)))
+      (c (+ 1 2)))
+  (print c)
   (defvar *aaa* a)
   (defvar *bbb* b))
 
@@ -89,53 +90,17 @@
       (sb-int:info :variable :macro-expansion '%trash%)
     (assert (and (not val) (not foundp)))))
 
-;;; COMPILE-FILE-LINE and COMPILE-FILE-POSITION
+;; This must be one toplevel form.
+;; In practice you'd never do anything like this I suspect.
+(progn
+  (defvar *foofoo1* 1)
+  (eval-when (:compile-toplevel)
+    (setq sb-c::*source-plist* '(strange "Yes")))
+  (defvar *foofoo2* 2))
 
-(macrolet ((line () `(multiple-value-call 'cons (compile-file-line))))
-  (defun more-foo (x)
-    (if x
-        (format nil "Great! ~D" (line)) ; <-- this is line 97
-        (format nil "Yikes ~D" (line)))))
-
-(declaim (inline thing))
-(defun thing ()
-  (format nil "failed to frob a knob at line #~D"
-          (compile-file-line))) ; <-- this is line 103
-
-(defmacro more-randomness ()
-  '(progn
-    (let ()
-      (thing))))
-
-(macrolet ()
-  (progn
-    (defun bork (x)
-      (flet ()
-        (if x
-            (locally (declare (notinline thing))
-              (more-randomness))
-            (progn (more-randomness))))))) ; <-- this is line 117
-
-(defun compile-file-pos-sharp-dot (x)
-  (list #.(format nil "Foo line ~D" (compile-file-line)) ; line #120
-        x))
-
-(defun compile-file-pos-eval-in-macro ()
-  (macrolet ((macro (x)
-               (format nil "hi ~A at ~D" x
-                       (compile-file-line)))) ; line #126
-    (macro "there")))
-
-(with-test (:name :compile-file-line)
-  (assert (string= (more-foo t) "Great! (97 . 32)"))
-  (assert (string= (more-foo nil) "Yikes (98 . 31)"))
-  (assert (string= (bork t) "failed to frob a knob at line #103"))
-  (assert (string= (bork nil) "failed to frob a knob at line #117"))
-  (assert (string= (car (compile-file-pos-sharp-dot nil))
-                    "Foo line 120"))
-  (assert (string= (compile-file-pos-eval-in-macro)
-                    "hi there at 126")))
-
-(eval-when (:compile-toplevel)
-  (let ((stream (sb-c::source-info-stream sb-c::*source-info*)))
-    (assert (pathname stream))))
+(with-test (:name :source-location-plist-invalid-memoization)
+  (assert (null (sb-c:definition-source-location-plist
+                    (sb-int:info :source-location :variable '*foofoo1*))))
+  (assert (equal (sb-c:definition-source-location-plist
+                     (sb-int:info :source-location :variable '*foofoo2*))
+                 '(strange "Yes"))))

@@ -11,6 +11,9 @@
 
 (in-package "SB!C")
 
+(defvar *handled-conditions* nil)
+(defvar *disabled-package-locks* nil)
+
 ;;; The LEXENV represents the lexical environment used for IR1 conversion.
 ;;; (This is also what shows up as an ENVIRONMENT value in macroexpansion.)
 #!-sb-fluid (declaim (inline internal-make-lexenv)) ; only called in one place
@@ -19,9 +22,10 @@
              (:constructor make-null-lexenv ())
              (:constructor internal-make-lexenv
                            (funs vars blocks tags
-                                 type-restrictions
-                                 lambda cleanup handled-conditions
-                                 disabled-package-locks %policy user-data)))
+                            type-restrictions
+                            lambda cleanup handled-conditions
+                            disabled-package-locks %policy user-data
+                            parent)))
   ;; an alist of (NAME . WHAT), where WHAT is either a FUNCTIONAL (a
   ;; local function), a DEFINED-FUN, representing an
   ;; INLINE/NOTINLINE declaration, or a list (MACRO . <function>) (a
@@ -64,11 +68,20 @@
   ;; and the global policy is stored in *POLICY*. (Because we want to
   ;; be able to affect it from :WITH-COMPILATION-UNIT.) NIL here also
   ;; works as a convenient null-lexenv identifier.
-  (%policy nil :type policy)
+  (%policy nil :type (or null policy))
   ;; A list associating extra user info to symbols.  The entries
   ;; are of the form (:declare name . value),
   ;; (:variable name key . value), or (:function name key . value)
-  (user-data nil :type list))
+  (user-data nil :type list)
+  parent)
+
+;;; the lexical environment we are currently converting in
+(defvar *lexenv*)
+(declaim (type lexenv *lexenv*))
+
+;;; an object suitable for input to standard functions that accept
+;;; "environment objects" (of the ANSI glossary)
+(def!type lexenv-designator () '(or lexenv null))
 
 (defun lexenv-policy (lexenv)
   (or (lexenv-%policy lexenv) *policy*))
@@ -89,6 +102,78 @@
         (write-string "NULL-LEXENV" stream))
       (default-structure-print lexenv stream level)))
 
+;;; Take the lexenv surrounding an inlined function and extract things
+;;; needed for the inline expansion suitable for dumping into fasls.
+;;; Right now it's MACROLET, SYMBOL-MACROLET, SPECIAL and
+;;; INLINE/NOTINLINE declarations. Upon encountering something else return NIL.
+;;; This is later used by PROCESS-INLINE-LEXENV to reproduce the lexenv.
+;;;
+;;; Previously it just used the functions and vars of the innermost
+;;; lexenv, but the body of macrolet can refer to other macrolets
+;;; defined earlier, so it needs to process all the parent lexenvs to
+;;; recover the proper order.
+(defun reconstruct-lexenv (lexenv)
+  (let (shadowed-funs
+        shadowed-vars
+        result)
+    (loop for env = lexenv then parent
+          for parent = (lexenv-parent env)
+          for vars = (lexenv-vars env)
+          for funs = (lexenv-funs env)
+          for declarations = nil
+          for symbol-macros = nil
+          for macros = nil
+          do
+          (loop for binding in vars
+                for (name . what) = binding
+                unless (and parent
+                            (find binding (lexenv-vars parent)))
+                do (typecase what
+                     (cons
+                      (aver (eq (car what) 'macro))
+                      (push name shadowed-vars)
+                      (push (list name (cdr what)) symbol-macros))
+                     (global-var
+                      (aver (eq (global-var-kind what) :special))
+                      (push `(special ,name) declarations))
+                     (t
+                      (unless (memq name shadowed-vars)
+                        (return-from reconstruct-lexenv)))))
+          (loop for binding in funs
+                for (name . what) = binding
+                unless (and parent
+                            (find binding (lexenv-funs parent)))
+                do
+                (typecase what
+                  (cons
+                   (push name shadowed-funs)
+                   (push (cons name (function-lambda-expression (cdr what))) macros))
+                  ;; FIXME: Is there a good reason for this not to be
+                  ;; DEFINED-FUN (which :INCLUDEs GLOBAL-VAR, in case
+                  ;; you're wondering how this ever worked :-)? Maybe
+                  ;; in conjunction with an AVERrance that it's not an
+                  ;; (AND GLOBAL-VAR (NOT GLOBAL-FUN))? -- CSR,
+                  ;; 2002-07-08
+                  (global-var
+                   (unless (defined-fun-p what)
+                     (return-from reconstruct-lexenv))
+                   (push `(,(car (rassoc (defined-fun-inlinep what)
+                                         *inlinep-translations*))
+                           ,name)
+                         declarations))
+                  (t
+                   (unless (memq name shadowed-funs)
+                     (return-from reconstruct-lexenv)))))
+          (when declarations
+            (setf result (list* :declare declarations (and result (list result)))))
+          (when symbol-macros
+            (setf result (list* :symbol-macro symbol-macros (and result (list result)))))
+          (when macros
+            (setf result (list* :macro macros (and result (list result)))))
+          while (and parent
+                     (not (null-lexenv-p parent))))
+    result))
+
 (defun maybe-inline-syntactic-closure (lambda lexenv)
   (declare (type list lambda) (type lexenv lexenv))
   (aver (eql (first lambda) 'lambda))
@@ -105,65 +190,13 @@
   ;; the target compiler. -- CSR, 2002-05-13 and 2002-11-02
   (let ((vars (lexenv-vars lexenv))
         (funs (lexenv-funs lexenv)))
-    (collect ((decls) (macros) (symbol-macros))
-      (cond
-        ((or (lexenv-blocks lexenv) (lexenv-tags lexenv)) nil)
-        ((and (null vars) (null funs)) `(lambda-with-lexenv
-                                         nil nil nil
-                                         ,@(cdr lambda)))
-        ((dolist (x vars nil)
-           #+sb-xc-host
-           ;; KLUDGE: too complicated for cross-compilation
-           (return t)
-           #-sb-xc-host
-           (let ((name (car x))
-                 (what (cdr x)))
-             ;; only worry about the innermost binding
-             (when (eq x (assoc name vars :test #'eq))
-               (typecase what
-                 (cons
-                  (aver (eq (car what) 'macro))
-                  (symbol-macros x))
-                 (global-var
-                  ;; A global should not appear in the lexical
-                  ;; environment? Is this true? FIXME!
-                  (aver (eq (global-var-kind what) :special))
-                  (decls `(special ,name)))
-                 (t
-                  ;; we can't inline in the presence of this object
-                  (return t))))))
-         nil)
-        ((dolist (x funs nil)
-           #+sb-xc-host
-           ;; KLUDGE: too complicated for cross-compilation (and
-           ;; failure of OAOO in comments, *sigh*)
-           (return t)
-           #-sb-xc-host
-           (let ((name (car x))
-                 (what (cdr x)))
-             ;; again, only worry about the innermost binding, but
-             ;; functions can have name (SETF FOO) so we need to use
-             ;; EQUAL for the test.
-             (when (eq x (assoc name funs :test #'equal))
-               (typecase what
-                 (cons
-                  (macros (cons name (function-lambda-expression (cdr what)))))
-                 ;; FIXME: Is there a good reason for this not to be
-                 ;; DEFINED-FUN (which :INCLUDEs GLOBAL-VAR, in case
-                 ;; you're wondering how this ever worked :-)? Maybe
-                 ;; in conjunction with an AVERrance that it's not an
-                 ;; (AND GLOBAL-VAR (NOT GLOBAL-FUN))? -- CSR,
-                 ;; 2002-07-08
-                 (global-var
-                  (when (defined-fun-p what)
-                    (decls `(,(car (rassoc (defined-fun-inlinep what)
-                                           *inlinep-translations*))
-                              ,name))))
-                 (t (return t))))))
-         nil)
-        (t
-         ;; if we get this far, we've successfully dealt with
-         ;; everything in FUNS and VARS, so:
-         `(lambda-with-lexenv ,(decls) ,(macros) ,(symbol-macros)
-                              ,@(cdr lambda)))))))
+    (cond
+      ((or (lexenv-blocks lexenv) (lexenv-tags lexenv)) nil)
+      ((and (null vars) (null funs)) lambda)
+      ;; too complicated for cross-compilation
+      #-sb-xc-host
+      (t
+       (let ((env (reconstruct-lexenv lexenv)))
+         (and env
+          `(lambda-with-lexenv ,env ,@(cdr lambda))))))))
 

@@ -241,20 +241,19 @@
 ;;    (GF.A GF.B &REST GF.REST &KEY GF.K-X M1.K-Z M1.K-Y M2.K-Q)
 ;;
 (deftest gf-interplay.1
-    (multiple-value-bind (required optional restp rest keyp keys allowp
-                                auxp aux morep more-context more-count)
+    (multiple-value-bind (llks required optional rest keys aux more)
         (sb-int:parse-lambda-list (function-lambda-list #'xuuq))
       (and (equal required '(gf.a gf.b))
            (null optional)
-           (and restp (eql rest 'gf.rest))
-           (and keyp
+           (eq (car rest) 'gf.rest)
+           (and (sb-int:ll-kwds-keyp llks)
                 (member 'gf.k-X keys)
                 (member 'm1.k-Y keys)
                 (member 'm1.k-Z keys)
                 (member 'm2.k-Q keys))
-           (not allowp)
-           (and (not auxp) (null aux))
-           (and (not morep) (null more-context) (not more-count))))
+           (not (sb-int:ll-kwds-allowp llks))
+           (null aux)
+           (null more)))
   t)
 
 ;;; Check what happens when there's no explicit DEFGENERIC.
@@ -275,7 +274,7 @@
 
 (deftest deftype-lambda-list.1
     (deftype-lambda-list 'foobar-type)
-  (&whole w &environment e r1 r2 &optional o &rest rest &key k1 k2 k3)
+  (r1 r2 &optional o &rest rest &key k1 k2 k3)
   t)
 
 (deftest deftype-lambda-list.2
@@ -553,29 +552,41 @@
 ;;; Defstruct accessor, copier, and predicate
 
 (deftest defstruct-fun-sources
-    (let ((copier (find-definition-source #'cl-user::copy-three))
-          (accessor (find-definition-source #'cl-user::three-four))
-          (predicate (find-definition-source #'cl-user::three-p)))
-      (values (and (equalp copier accessor)
-                   (equalp copier predicate))
-              (equal "TEST.LISP.NEWEST"
-                     (file-namestring (definition-source-pathname copier)))
-              (equal '(5)
-                     (definition-source-form-path copier))))
- t
- t
- t)
+  (let ((copier (find-definition-source #'cl-user::copy-three))
+        (accessor (find-definition-source #'cl-user::three-four))
+        (predicate (find-definition-source #'cl-user::three-p)))
+    (values (and (equalp copier accessor)
+                 (equalp copier predicate))
+            (equal "TEST.LISP.NEWEST"
+                   (file-namestring (definition-source-pathname copier)))
+            (equal '(5)
+                   (definition-source-form-path copier))))
+  t
+  t
+  t)
 
 (deftest defstruct-fun-sources-by-name
-    (let ((copier (car (find-definition-sources-by-name 'cl-user::copy-three :function)))
-          (accessor (car (find-definition-sources-by-name 'cl-user::three-four :function)))
-          (predicate (car (find-definition-sources-by-name 'cl-user::three-p :function))))
-      (values (and (equalp copier accessor)
-                   (equalp copier predicate))
-              (equal "TEST.LISP.NEWEST"
-                     (file-namestring (definition-source-pathname copier)))
-              (equal '(5)
-                     (definition-source-form-path copier))))
- t
- t
- t)
+  (let ((copier (car (find-definition-sources-by-name 'cl-user::copy-three :function)))
+        (accessor (car (find-definition-sources-by-name 'cl-user::three-four :function)))
+        (predicate (car (find-definition-sources-by-name 'cl-user::three-p :function))))
+    (values (and (equalp copier accessor)
+                 (equalp copier predicate))
+            (equal "TEST.LISP.NEWEST"
+                   (file-namestring (definition-source-pathname copier)))
+            (equal '(5)
+                   (definition-source-form-path copier))))
+  t
+  t
+  t)
+
+(deftest alien-type.1
+  (matchp-name :alien-type 'cl-user::test-alien-type 30)
+  t)
+
+(deftest alien-type.2
+  (matchp-name :alien-type 'cl-user::test-alien-struct 31)
+  t)
+
+(deftest alien-variable
+  (matchp-name :variable 'cl-user::test-alien-var 32)
+  t)

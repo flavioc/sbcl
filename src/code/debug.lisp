@@ -65,7 +65,10 @@ provide bindings for printer control variables.")
 ;;; If this is bound before the debugger is invoked, it is used as the stack
 ;;; top by the debugger. It can either be the first interesting frame, or the
 ;;; name of the last uninteresting frame.
-(defvar *stack-top-hint* nil)
+;;; This is a !DEFVAR so that cold-init can use SIGNAL.
+;;; It actually works as long as the condition is not a subtype of WARNING
+;;; or ERROR. (Any other direct descendant of CONDITION should be fine)
+(!defvar *stack-top-hint* nil)
 
 (defvar *real-stack-top* nil)
 (defvar *stack-top* nil)
@@ -216,14 +219,12 @@ backtraces. Possible values are :MINIMAL, :NORMAL, and :FULL.
 (define-deprecated-variable :early "1.1.4.9" *show-entry-point-details*
   :value nil)
 
-(defun backtrace (&optional (count *backtrace-frame-count*) (stream *debug-io*))
-  #!+sb-doc
-  "Replaced by PRINT-BACKTRACE, will eventually be deprecated."
+(define-deprecated-function :early "1.2.15" backtrace (print-backtrace)
+    (&optional (count *backtrace-frame-count*) (stream *debug-io*))
   (print-backtrace :count count :stream stream))
 
-(defun backtrace-as-list (&optional (count *backtrace-frame-count*))
-  #!+sb-doc
-  "Replaced by LIST-BACKTRACE, will eventually be deprecated."
+(define-deprecated-function :early "1.2.15" backtrace-as-list (list-backtrace)
+    (&optional (count *backtrace-frame-count*))
   (list-backtrace :count count))
 
 (defun backtrace-start-frame (frame-designator)
@@ -235,7 +236,7 @@ backtraces. Possible values are :MINIMAL, :NORMAL, and :FULL.
                        do (setf frame (or (sb!di:frame-down frame) frame)))
                  frame))
              (interrupted-frame ()
-               (or (nth-value 1 (find-interrupted-name-and-frame))
+               (or (find-interrupted-frame)
                    (current-frame))))
      (cond ((eq :current-frame frame-designator)
             (current-frame))
@@ -844,11 +845,11 @@ the current thread are replaced with dummy objects which can safely escape."
     (cond
       ;; No hint, just keep the debugger guts out.
       ((not hint)
-       (find-caller-name-and-frame))
+       (find-caller-frame))
       ;; Interrupted. Look for the interrupted frame -- if we don't find one
       ;; this falls back to the next case.
       ((and (eq hint 'invoke-interruption)
-            (nth-value 1 (find-interrupted-name-and-frame))))
+            (find-interrupted-frame)))
       ;; Name of the first uninteresting frame.
       ((symbolp hint)
        (find-caller-of-named-frame hint))
@@ -859,33 +860,27 @@ the current thread are replaced with dummy objects which can safely escape."
 (defun invoke-debugger (condition)
   #!+sb-doc
   "Enter the debugger."
-
   (let ((*stack-top-hint* (resolve-stack-top-hint)))
-
     ;; call *INVOKE-DEBUGGER-HOOK* first, so that *DEBUGGER-HOOK* is not
     ;; called when the debugger is disabled
     (run-hook '*invoke-debugger-hook* condition)
     (run-hook '*debugger-hook* condition)
-
     ;; We definitely want *PACKAGE* to be of valid type.
     ;;
     ;; Elsewhere in the system, we use the SANE-PACKAGE function for
     ;; this, but here causing an exception just as we're trying to handle
     ;; an exception would be confusing, so instead we use a special hack.
-    (unless (and (packagep *package*)
-                 (package-name *package*))
+    (unless (package-name *package*)
       (setf *package* (find-package :cl-user))
       (format *error-output*
               "The value of ~S was not an undeleted PACKAGE. It has been ~
                reset to ~S."
               '*package* *package*))
-
     ;; Before we start our own output, finish any pending output.
     ;; Otherwise, if the user tried to track the progress of his program
     ;; using PRINT statements, he'd tend to lose the last line of output
     ;; or so, which'd be confusing.
     (flush-standard-output-streams)
-
     (funcall-with-debug-io-syntax #'%invoke-debugger condition)))
 
 (defun %print-debugger-invocation-reason (condition stream)

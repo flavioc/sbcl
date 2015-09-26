@@ -679,26 +679,6 @@
 
 ;;;; structure used during output emission
 
-;;; common supertype for all the different kinds of annotations
-(def!struct (annotation (:constructor nil)
-                        (:copier nil))
-  ;; Where in the raw output stream was this annotation emitted?
-  (index 0 :type index)
-  ;; What position does that correspond to?
-  (posn nil :type (or index null)))
-
-(def!struct (label (:include annotation)
-                   (:constructor gen-label ())
-                   (:copier nil))
-  ;; (doesn't need any additional information beyond what is in the
-  ;; annotation structure)
-  )
-(sb!int:def!method print-object ((label label) stream)
-  (if (or *print-escape* *print-readably*)
-      (print-unreadable-object (label stream :type t)
-        (prin1 (sb!c:label-id label) stream))
-      (format stream "L~D" (sb!c:label-id label))))
-
 ;;; a constraint on how the output stream must be aligned
 (def!struct (alignment-note (:include annotation)
                             (:conc-name alignment-)
@@ -1678,17 +1658,11 @@
                 (append ,@(extract-nths 0 'list pdefs)))))))))
 
 (defmacro define-instruction-macro (name lambda-list &body body)
-  (with-unique-names (whole env)
-    (multiple-value-bind (body local-defs)
-        (sb!kernel:parse-defmacro lambda-list whole body name
-                                  'instruction-macro
-                                  :environment env)
-      `(eval-when (:compile-toplevel :load-toplevel :execute)
-         (%define-instruction ,(symbol-name name)
-                              (lambda (,whole ,env)
-                                ,@local-defs
-                                (block ,name
-                                  ,body)))))))
+  (let ((namestring (symbol-name name)))
+    `(eval-when (:compile-toplevel :load-toplevel :execute)
+       (%define-instruction ,namestring
+                            ,(make-macro-lambda
+                              namestring lambda-list body 'inst name)))))
 
 (defun %define-instruction (name defun)
   (setf (gethash name *assem-instructions*) defun)

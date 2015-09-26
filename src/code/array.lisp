@@ -274,7 +274,7 @@
                        (parse-unknown-type ()
                          (return (result sb!vm:simple-vector-widetag))))))
                (typecase ctype
-                 (union-type
+                 (union-type ; FIXME: forward ref
                   (let ((types (union-type-types ctype)))
                     (cond ((not (every #'numeric-type-p types))
                            (result sb!vm:simple-vector-widetag))
@@ -291,7 +291,7 @@
                            (result sb!vm:simple-array-long-float-widetag))
                           (t
                            (result sb!vm:simple-vector-widetag)))))
-                 (character-set-type
+                 (character-set-type ; FIXME: forward ref
                   #!-sb-unicode (result sb!vm:simple-base-string-widetag)
                   #!+sb-unicode
                   (if (loop for (start . end)
@@ -667,8 +667,11 @@ of specialized arrays is supported."
 (macrolet ((define-reffer (saetp check-form)
              (let* ((type (sb!vm:saetp-specifier saetp))
                     (atype `(simple-array ,type (*))))
-               `(named-lambda optimized-data-vector-ref (vector index)
+               `(named-lambda (optimized-data-vector-ref ,type) (vector index)
                   (declare (optimize speed (safety 0))
+                           ;; Obviously these all coerce raw words to lispobjs
+                           ;; so don't keep spewing notes about it.
+                           (muffle-conditions compiler-note)
                            (ignorable index))
                   ,(if type
                        `(data-vector-ref (the ,atype vector)
@@ -680,8 +683,11 @@ of specialized arrays is supported."
            (define-setter (saetp check-form)
              (let* ((type (sb!vm:saetp-specifier saetp))
                     (atype `(simple-array ,type (*))))
-               `(named-lambda optimized-data-vector-set (vector index new-value)
+               `(named-lambda (optimized-data-vector-set ,type) (vector index new-value)
                   (declare (optimize speed (safety 0)))
+                  ;; Impossibly setting an elt of an (ARRAY NIL)
+                  ;; returns no value. And nobody cares.
+                  (declare (muffle-conditions compiler-note))
                   (data-vector-set (the ,atype vector)
                                    (locally
                                        (declare (optimize (safety 1)))
@@ -770,53 +776,71 @@ of specialized arrays is supported."
              :expected-type `(integer 0 (,bound)))))
 
 ;;; SUBSCRIPTS has a dynamic-extent list structure and is destroyed
-(defun %array-row-major-index (array subscripts
-                                     &optional (invalid-index-error-p t))
-  (declare (array array)
-           (list subscripts))
-  (let ((rank (array-rank array)))
-    (unless (= rank (length subscripts))
-      (error "wrong number of subscripts, ~W, for array of rank ~W"
-             (length subscripts) rank))
-    (if (array-header-p array)
-        (do ((subs (nreverse subscripts) (cdr subs))
-             (axis (1- (array-rank array)) (1- axis))
-             (chunk-size 1)
-             (result 0))
-            ((null subs) result)
-          (declare (list subs) (fixnum axis chunk-size result))
-          (let ((index (car subs))
-                (dim (%array-dimension array axis)))
-            (declare (fixnum dim))
-            (unless (and (fixnump index) (< -1 index dim))
-              (if invalid-index-error-p
-                  (invalid-array-index-error array index dim axis)
-                  (return-from %array-row-major-index nil)))
-            (incf result (* chunk-size (the fixnum index)))
-            (setf chunk-size (* chunk-size dim))))
-        (let ((index (first subscripts))
-              (length (length (the (simple-array * (*)) array))))
-          (unless (and (fixnump index) (< -1 index length))
-            (if invalid-index-error-p
-                (invalid-array-index-error array index length)
-                (return-from %array-row-major-index nil)))
-          index))))
+(defun %array-row-major-index (array &rest subscripts)
+  (declare (truly-dynamic-extent subscripts)
+           (array array))
+  (let ((length (length subscripts)))
+    (cond ((array-header-p array)
+           (let ((rank (%array-rank array)))
+             (unless (= rank length)
+               (error "wrong number of subscripts, ~W, for array of rank ~W."
+                      length rank))
+             (do ((axis (1- rank) (1- axis))
+                  (chunk-size 1)
+                  (result 0))
+                 ((minusp axis) result)
+               (declare (fixnum axis chunk-size result))
+               (let ((index (fast-&rest-nth axis subscripts))
+                     (dim (%array-dimension array axis)))
+                 (unless (and (fixnump index) (< -1 index dim))
+                   (invalid-array-index-error array index dim axis))
+                 (setf result
+                       (truly-the fixnum
+                                  (+ result
+                                     (truly-the fixnum (* chunk-size index))))
+                       chunk-size (truly-the fixnum (* chunk-size dim)))))))
+          ((/= length 1)
+           (error "Wrong number of subscripts, ~W, for array of rank 1."
+                  length))
+          (t
+           (let ((index (fast-&rest-nth 0 subscripts))
+                 (length (length (the (simple-array * (*)) array))))
+             (unless (and (fixnump index) (< -1 index length))
+               (invalid-array-index-error array index length))
+             index)))))
 
 (defun array-in-bounds-p (array &rest subscripts)
   #!+sb-doc
   "Return T if the SUBSCRIPTS are in bounds for the ARRAY, NIL otherwise."
-  (if (%array-row-major-index array subscripts nil)
-      t))
+  (declare (truly-dynamic-extent subscripts))
+  (let ((length (length subscripts)))
+    (cond ((array-header-p array)
+           (let ((rank (%array-rank array)))
+             (unless (= rank length)
+               (error "Wrong number of subscripts, ~W, for array of rank ~W."
+                      length rank))
+             (loop for i below length
+                   for s = (fast-&rest-nth i subscripts)
+                   always (and (typep s '(and fixnum unsigned-byte))
+                               (< s (%array-dimension array i))))))
+          ((/= length 1)
+           (error "Wrong number of subscripts, ~W, for array of rank 1."
+                  length))
+          (t
+           (let ((subscript (fast-&rest-nth 0 subscripts)))
+             (and (typep subscript '(and fixnum unsigned-byte))
+                  (< subscript
+                     (length (truly-the (simple-array * (*)) array)))))))))
 
 (defun array-row-major-index (array &rest subscripts)
   (declare (truly-dynamic-extent subscripts))
-  (%array-row-major-index array subscripts))
+  (apply #'%array-row-major-index array subscripts))
 
 (defun aref (array &rest subscripts)
   #!+sb-doc
   "Return the element of the ARRAY specified by the SUBSCRIPTS."
   (declare (truly-dynamic-extent subscripts))
-  (row-major-aref array (%array-row-major-index array subscripts)))
+  (row-major-aref array (apply #'%array-row-major-index array subscripts)))
 
 ;;; (setf aref/bit/sbit) are implemented using setf-functions,
 ;;; because they have to work with (setf (apply #'aref array subscripts))
@@ -826,7 +850,7 @@ of specialized arrays is supported."
 (defun (setf aref) (new-value array &rest subscripts)
   (declare (truly-dynamic-extent subscripts)
            (type array array))
-  (setf (row-major-aref array (%array-row-major-index array subscripts))
+  (setf (row-major-aref array (apply #'%array-row-major-index array subscripts))
         new-value))
 
 (defun row-major-aref (array index)
@@ -856,7 +880,7 @@ of specialized arrays is supported."
   (declare (type (array bit) bit-array)
            (truly-dynamic-extent subscripts)
            (optimize (safety 1)))
-  (row-major-aref bit-array (%array-row-major-index bit-array subscripts)))
+  (row-major-aref bit-array (apply #'%array-row-major-index bit-array subscripts)))
 
 (defun (setf bit) (new-value bit-array &rest subscripts)
   (declare (type (array bit) bit-array)
@@ -864,7 +888,7 @@ of specialized arrays is supported."
            (truly-dynamic-extent subscripts)
            (optimize (safety 1)))
   (setf (row-major-aref bit-array
-                        (%array-row-major-index bit-array subscripts))
+                        (apply #'%array-row-major-index bit-array subscripts))
         new-value))
 
 (defun sbit (simple-bit-array &rest subscripts)
@@ -874,7 +898,7 @@ of specialized arrays is supported."
            (truly-dynamic-extent subscripts)
            (optimize (safety 1)))
   (row-major-aref simple-bit-array
-                  (%array-row-major-index simple-bit-array subscripts)))
+                  (apply #'%array-row-major-index simple-bit-array subscripts)))
 
 (defun (setf sbit) (new-value bit-array &rest subscripts)
   (declare (type (simple-array bit) bit-array)
@@ -882,7 +906,7 @@ of specialized arrays is supported."
            (truly-dynamic-extent subscripts)
            (optimize (safety 1)))
   (setf (row-major-aref bit-array
-                        (%array-row-major-index bit-array subscripts))
+                        (apply #'%array-row-major-index bit-array subscripts))
         new-value))
 
 ;;;; miscellaneous array properties
@@ -1091,7 +1115,7 @@ of specialized arrays is supported."
   "Adjust ARRAY's dimensions to the given DIMENSIONS and stuff."
   (when (invalid-array-p array)
     (invalid-array-error array))
-  (binding* ((dimensions (if (listp dimensions) dimensions (list dimensions)))
+  (binding* ((dimensions (ensure-list dimensions))
              (array-rank (array-rank array))
              (()
               (unless (= (length dimensions) array-rank)
@@ -1608,7 +1632,7 @@ function to be removed without further warning."
            (error 'type-error
                   :datum (first args)
                   :expected-type '(simple-array * (*)))))
-       (defglobal ,table-name (make-array ,(1+ sb!vm:widetag-mask)
+       (!defglobal ,table-name (make-array ,(1+ sb!vm:widetag-mask)
                                           :initial-element #',error-name))
        ,@(loop for info across sb!vm:*specialized-array-element-type-properties*
                for typecode = (sb!vm:saetp-typecode info)

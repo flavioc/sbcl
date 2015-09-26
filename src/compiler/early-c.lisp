@@ -67,10 +67,6 @@
     (notinline . :notinline)
     (maybe-inline . :maybe-inline)))
 
-;;; the lexical environment we are currently converting in
-(defvar *lexenv*)
-(declaim (type lexenv *lexenv*))
-
 ;;; *FREE-VARS* translates from the names of variables referenced
 ;;; globally to the LEAF structures for them. *FREE-FUNS* is like
 ;;; *FREE-VARS*, only it deals with function names.
@@ -105,10 +101,6 @@
 (defvar *current-component*)
 (defvar *delayed-ir1-transforms*)
 (defvar *eval-tlf-index*)
-(defvar *handled-conditions*)
-(defvar *disabled-package-locks*)
-(defvar *policy*)
-(defvar *macro-policy* nil)
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere*)
 (defvar *event-info*)
@@ -120,7 +112,6 @@
   (defvar *constant-segment*)
   (defvar *constant-table*)
   (defvar *constant-vector*))
-(defvar *lexenv*)
 (defvar *source-info*)
 (defvar *source-plist*)
 (defvar *source-namestring*)
@@ -171,6 +162,23 @@ the stack without triggering overflow protection.")
 ;;; can detect whether function definitions have occurred.
 (declaim (fixnum *type-cache-nonce*))
 (!defglobal *type-cache-nonce* 0)
+
+(def!struct (undefined-warning
+            #-no-ansi-print-object
+            (:print-object (lambda (x s)
+                             (print-unreadable-object (x s :type t)
+                               (prin1 (undefined-warning-name x) s))))
+            (:copier nil))
+  ;; the name of the unknown thing
+  (name nil :type (or symbol list))
+  ;; the kind of reference to NAME
+  (kind (missing-arg) :type (member :function :type :variable))
+  ;; the number of times this thing was used
+  (count 0 :type unsigned-byte)
+  ;; a list of COMPILER-ERROR-CONTEXT structures describing places
+  ;; where this thing was used. Note that we only record the first
+  ;; *UNDEFINED-WARNING-LIMIT* calls.
+  (warnings () :type list))
 
 ;;; Delete any undefined warnings for NAME and KIND. This is for the
 ;;; benefit of the compiler, but it's sometimes called from stuff like
@@ -248,6 +256,7 @@ the stack without triggering overflow protection.")
 (setf *debug-name-sharp* (make-debug-name-marker)
       *debug-name-ellipsis* (make-debug-name-marker))
 
+(declaim (ftype (sfunction () list) name-context))
 (defun debug-name (type thing &optional context)
   (let ((*debug-name-punt* nil))
     (labels ((walk (x)

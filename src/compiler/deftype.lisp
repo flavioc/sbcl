@@ -9,15 +9,21 @@
 
 (in-package "SB!IMPL")
 
+(defun constant-type-body-p (forms)
+  (destructuring-bind (&optional first . rest) forms
+    (and first (not rest)
+         (or (member first '(t nil))
+             (and (consp first) (eq (car first) 'quote))))))
+
 (defun constant-type-expander (expansion)
   (declare (optimize safety))
   (lambda (whole)
+    (declare (sb!c::lambda-list ())) ; for introspection of DEFTYPE lambda-list
     (if (cdr whole)
-        (sb!kernel::arg-count-error 'deftype (car whole) (cdr whole) nil 0 0)
+        (error 'sb!kernel::arg-count-error
+               :kind 'deftype :name (car whole) :args (cdr whole)
+               :lambda-list '() :minimum 0 :maximum 0)
         expansion)))
-
-(defun %deftype (name)
-  (setf (classoid-cell-pcl-class (find-classoid-cell name :create t)) nil))
 
 (defvar !*xc-processed-deftypes* nil)
 (def!macro sb!xc:deftype (&whole form name lambda-list &body body)
@@ -31,18 +37,20 @@
         ;; FIXME: We could use CONSTANTP here to deal with slightly more
         ;; complex deftypes using CONSTANT-TYPE-EXPANDER, but that XC:CONSTANTP
         ;; is not availble early enough.
-        (if (and (not lambda-list) (not decls) (not (cdr forms))
-                 (or (member (car forms) '(t nil))
-                     (and (consp (car forms)) (eq 'quote (caar forms)))))
-            (values `(constant-type-expander ,(car forms)) doc '(sb!c:source-location))
-            (with-unique-names (whole)
-              (multiple-value-bind (macro-body local-decs doc)
-                  (parse-defmacro lambda-list whole body name 'deftype :default-default ''*)
-                (values `(lambda (,whole)
-                           ,@local-decs
-                           ,macro-body)
-                        doc
-                        nil)))))
+        (if (and (not lambda-list) (not decls) (constant-type-body-p forms))
+            (progn
+              #-sb-xc-host (check-deprecated-type
+                            (typecase forms
+                              ((cons (cons (eql quote))) (cadar forms))
+                              ((cons symbol)             (car forms))))
+              (values `(constant-type-expander ,(car forms)) doc
+                      '(sb!c:source-location)))
+            ;; FIXME: it seems non-ANSI-compliant to pretend every lexenv
+            ;; is nil. See also lp#309140.
+            (make-macro-lambda `(type-expander ,name)
+                               lambda-list body 'deftype name
+                               :doc-string-allowed :external
+                               :environment :ignore)))
     `(progn
        #+sb-xc-host
        (eval-when (:compile-toplevel)
@@ -50,10 +58,5 @@
          ;; but not when running the xc. But it's harmless in the latter.
          (pushnew ',name !*xc-processed-deftypes*))
        (eval-when (:compile-toplevel :load-toplevel :execute)
-         (%compiler-deftype ',name
-                            ',lambda-list
-                            ,expander-form
-                            ,doc
-                            ,source-location-form))
-       (%deftype ',name)
-       ',name)))
+         (%compiler-deftype ',name ,expander-form ,source-location-form
+                            ,@(when doc `(,doc)))))))

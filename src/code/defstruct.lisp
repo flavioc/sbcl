@@ -24,7 +24,9 @@
            (error "Class is not yet defined or was undefined: ~S" name))
           ((not (typep (layout-info res) 'defstruct-description))
            (error "Class is not a structure class: ~S" name))
-          (t res))))
+          (t
+           (sb!int:check-deprecated-type name)
+           res))))
 
 (defun compiler-layout-ready-p (name)
   (let ((layout (info :type :compiler-layout name)))
@@ -109,67 +111,7 @@
 
 ;;; The DEFSTRUCT-DESCRIPTION structure holds compile-time information
 ;;; about a structure type.
-(def!struct (defstruct-description
-             (:conc-name dd-)
-             (:make-load-form-fun just-dump-it-normally)
-             #-sb-xc-host (:pure t)
-             (:constructor make-defstruct-description (name)))
-  ;; name of the structure
-  (name (missing-arg) :type symbol :read-only t)
-  ;; documentation on the structure
-  (doc nil :type (or string null))
-  ;; prefix for slot names. If NIL, none.
-  (conc-name nil :type (or string null))
-  ;; the name of the primary standard keyword constructor, or NIL if none
-  (default-constructor nil :type symbol)
-  ;; all the explicit :CONSTRUCTOR specs, with name defaulted
-  (constructors () :type list)
-  ;; name of copying function
-  (copier-name nil :type symbol)
-  ;; name of type predicate
-  (predicate-name nil :type symbol)
-  ;; the arguments to the :INCLUDE option, or NIL if no included
-  ;; structure
-  (include nil :type list)
-  ;; properties used to define structure-like classes with an
-  ;; arbitrary superclass and that may not have STRUCTURE-CLASS as the
-  ;; metaclass. Syntax is:
-  ;;    (superclass-name metaclass-name metaclass-constructor)
-  (alternate-metaclass nil :type list)
-  ;; a list of DEFSTRUCT-SLOT-DESCRIPTION objects for all slots
-  ;; (including included ones)
-  (slots () :type list)
-  ;; a list of (NAME . INDEX) pairs for accessors of included structures
-  (inherited-accessor-alist () :type list)
-  ;; number of elements we've allocated (See also RAW-LENGTH, which is not
-  ;; included in LENGTH.)
-  (length 0 :type index)
-  ;; General kind of implementation.
-  (type 'structure :type (member structure vector list
-                                 funcallable-structure))
-
-  ;; The next three slots are for :TYPE'd structures (which aren't
-  ;; classes, DD-CLASS-P = NIL)
-  ;;
-  ;; vector element type
-  (element-type t)
-  ;; T if :NAMED was explicitly specified, NIL otherwise
-  (named nil :type boolean)
-  ;; any INITIAL-OFFSET option on this direct type
-  (offset nil :type (or index null))
-
-  ;; which :PRINT-mumble option was given, if either was.
-  (print-option nil :type (member nil :print-function :print-object))
-  ;; the argument to the PRINT-FUNCTION or PRINT-OBJECT option.
-  ;; NIL if the option was given with no argument.
-  (printer-fname nil :type (or cons symbol))
-
-  ;; The number of untagged slots at the end.
-  #!-interleaved-raw-slots (raw-length 0 :type index)
-  ;; the value of the :PURE option, or :UNSPECIFIED. This is only
-  ;; meaningful if DD-CLASS-P = T.
-  (pure :unspecified :type (member t nil :unspecified)))
-#!-sb-fluid (declaim (freeze-type defstruct-description))
+;;; Its definition occurs in 'early-classoid.lisp'
 (def!method print-object ((x defstruct-description) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (prin1 (dd-name x) stream)))
@@ -251,6 +193,26 @@
       forms
       `(eval ',forms)))
 
+(defun %defstruct-package-locks (dd)
+  (let ((name (dd-name dd)))
+    #+sb-xc-host (declare (ignore name))
+    (with-single-package-locked-error
+        (:symbol name "defining ~S as a structure"))
+    (awhen (dd-predicate-name dd)
+      (with-single-package-locked-error
+          (:symbol it "defining ~s as a predicate for ~s structure" name)))
+    (awhen (dd-copier-name dd)
+      (with-single-package-locked-error
+          (:symbol it "defining ~s as a copier for ~s structure" name)))
+    (dolist (const (dd-constructors dd))
+      (awhen (car const)
+        (with-single-package-locked-error
+            (:symbol it "defining ~s as a constructor for ~s structure" name))))
+    (dolist (dsd (dd-slots dd))
+      (awhen (dsd-accessor-name dsd)
+        (with-single-package-locked-error
+            (:symbol it "defining ~s as an accessor for ~s structure" name))))))
+
 ;;; shared logic for host macroexpansion for SB!XC:DEFSTRUCT and
 ;;; cross-compiler macroexpansion for CL:DEFSTRUCT
 (defun %expander-for-defstruct (name-and-options slot-descriptions
@@ -264,8 +226,15 @@
                                           #-sb-xc :host)))
   (let* ((dd (parse-defstruct-name-and-options-and-slot-descriptions
               name-and-options slot-descriptions))
-         (inherits (if (dd-class-p dd) (inherits-for-structure dd)))
          (name (dd-name dd))
+         (inherits
+          (if (dd-class-p dd)
+              #+sb-xc-host (!inherits-for-structure dd)
+              #-sb-xc-host
+              (let ((super (compiler-layout-or-lose (or (first (dd-include dd))
+                                                        'structure-object))))
+                (concatenate 'simple-vector
+                             (layout-inherits super) (vector super)))))
          (print-method
           (when (dd-print-option dd)
             (let* ((x (sb!xc:gensym "OBJECT"))
@@ -286,21 +255,21 @@
                 (funcall #',fname ,x ,s
                          ,@(if depthp `(*current-level-in-print*)))))))))
     `(progn
-                ;; Note we intentionally enforce package locks and
-                ;; call %DEFSTRUCT first, and especially before
-                ;; %COMPILER-DEFSTRUCT. %DEFSTRUCT has the tests (and
-                ;; resulting CERROR) for collisions with LAYOUTs which
-                ;; already exist in the runtime. If there are any
-                ;; collisions, we want the user's response to CERROR
-                ;; to control what happens. Especially, if the user
-                ;; responds to the collision with ABORT, we don't want
-                ;; %COMPILER-DEFSTRUCT to modify the definition of the
-                ;; class.
-       ,@(when (eq expanding-into-code-for :target)
-           `((with-single-package-locked-error
-                 (:symbol ',name "defining ~A as a structure"))))
        ,@(if (dd-class-p dd)
-             `((%defstruct ',dd ',inherits (sb!c:source-location))
+             `(,@(when (eq expanding-into-code-for :target)
+                   `((eval-when (:compile-toplevel :load-toplevel :execute)
+                       ;; Note we intentionally enforce package locks and
+                       ;; call %DEFSTRUCT first, and especially before
+                       ;; %COMPILER-DEFSTRUCT. %DEFSTRUCT has the tests (and
+                       ;; resulting CERROR) for collisions with LAYOUTs which
+                       ;; already exist in the runtime. If there are any
+                       ;; collisions, we want the user's response to CERROR
+                       ;; to control what happens. Especially, if the user
+                       ;; responds to the collision with ABORT, we don't want
+                       ;; %COMPILER-DEFSTRUCT to modify the definition of the
+                       ;; class.
+                       (%defstruct-package-locks ',dd))))
+               (%defstruct ',dd ',inherits (sb!c:source-location))
                (eval-when (:compile-toplevel :load-toplevel :execute)
                  (%compiler-defstruct ',dd ',inherits))
                ,@(unless (eq expanding-into-code-for :host)
@@ -311,12 +280,6 @@
                              ,@(accessor-definitions dd)))
                 ;; This must be in the same lexical environment
                      ,@(constructor-definitions dd)
-                     ,@(when (eq (dd-pure dd) t)
-                         ;; Seems like %TARGET-DEFSTRUCT should do this
-                         `((locally
-                            (declare (notinline find-classoid))
-                            (setf (layout-pure (classoid-layout
-                                                (find-classoid ',name))) t))))
                      ,@print-method
                 ;; Various other operations only make sense on the target SBCL.
                      (%target-defstruct ',dd))))
@@ -823,13 +786,7 @@ unless :NAMED is also specified.")))
           ;; GENERIC-FUNCTION, and it's certainly not ANSI-compliant.
           (let* ((included-layout (classoid-layout included-classoid))
                  (included-dd (layout-info included-layout)))
-            (when (and (dd-alternate-metaclass included-dd)
-                       ;; As of sbcl-0.pre7.73, anyway, STRUCTURE-OBJECT
-                       ;; is represented with an ALTERNATE-METACLASS. But
-                       ;; it's specifically OK to :INCLUDE (and PCL does)
-                       ;; so in this one case, it's OK to include
-                       ;; something with :ALTERNATE-METACLASS after all.
-                       (not (eql included-name 'structure-object)))
+            (when (dd-alternate-metaclass included-dd)
               (error "can't :INCLUDE class ~S (has alternate metaclass)"
                      included-name)))))
 
@@ -852,10 +809,6 @@ unless :NAMED is also specified.")))
 
       (incf (dd-length dd) (dd-length included-structure))
       (when (dd-class-p dd)
-        (let ((mc (rest (dd-alternate-metaclass included-structure))))
-          (when (and mc (not (dd-alternate-metaclass dd)))
-            (setf (dd-alternate-metaclass dd)
-                  (cons included-name mc))))
         (when (eq (dd-pure dd) :unspecified)
           (setf (dd-pure dd) (dd-pure included-structure)))
         #!-interleaved-raw-slots
@@ -896,7 +849,8 @@ unless :NAMED is also specified.")))
 
 ;;; This function is called at macroexpand time to compute the INHERITS
 ;;; vector for a structure type definition.
-(defun inherits-for-structure (info)
+;;; The cross-compiler is allowed to magically compute LAYOUT-INHERITS.
+(defun !inherits-for-structure (info)
   (declare (type defstruct-description info))
   (let* ((include (dd-include info))
          (superclass-opt (dd-alternate-metaclass info))
@@ -908,15 +862,17 @@ unless :NAMED is also specified.")))
                                     'structure-object))))))
     (case (dd-name info)
       ((ansi-stream)
+       ;; STREAM is an abstract class and you can't :include it,
+       ;; so the inheritance has to be hardcoded.
        (concatenate 'simple-vector
                     (layout-inherits super)
                     (vector super (classoid-layout (find-classoid 'stream)))))
-      ((fd-stream)
+      ((fd-stream) ; Similarly, FILE-STREAM is abstract
        (concatenate 'simple-vector
                     (layout-inherits super)
                     (vector super
                             (classoid-layout (find-classoid 'file-stream)))))
-      ((sb!impl::string-input-stream
+      ((sb!impl::string-input-stream ; etc
         sb!impl::string-output-stream
         sb!impl::fill-pointer-output-stream)
        (concatenate 'simple-vector
@@ -1295,13 +1251,11 @@ or they must be declared locally notinline at each call site.~@:>")
                                     &key compiler-layout)
   (declare (type defstruct-description info))
   (multiple-value-bind (class old-layout)
-      (destructuring-bind
-          (&optional
-           name
-           (class 'structure-classoid)
-           (constructor 'make-structure-classoid))
-          (dd-alternate-metaclass info)
-        (declare (ignore name))
+      (multiple-value-bind (class constructor)
+          (acond ((cdr (dd-alternate-metaclass info))
+                  (values (first it) (second it)))
+                 (t
+                  (values 'structure-classoid 'make-structure-classoid)))
         (insured-find-classoid (dd-name info)
                                (if (eq class 'structure-classoid)
                                    (lambda (x)
@@ -1501,9 +1455,11 @@ or they must be declared locally notinline at each call site.~@:>")
         (let* ((name (dsd-name slot))
                (dum (copy-symbol name))
                (keyword (keywordicate name))
+               (specfied-type `(and ,int-type ,(dsd-type slot)))
                ;; Canonicalize the type for a prettier macro-expansion
-               (type (type-specifier
-                      (specifier-type `(and ,int-type ,(dsd-type slot))))))
+               ;; but leave it as is if there is a conflict.
+               (type (or (type-specifier (specifier-type specfied-type))
+                         specfied-type)))
           (arglist `((,keyword ,dum) ,(dsd-default slot)))
           (vals dum)
           ;; KLUDGE: we need a separate type declaration for for
@@ -1520,8 +1476,11 @@ or they must be declared locally notinline at each call site.~@:>")
 ;;; the appropriate args to make a constructor.
 (defun create-boa-constructor (defstruct boa creator)
   (declare (type function creator))
-  (multiple-value-bind (req opt restp rest keyp keys allowp auxp aux)
-      (parse-lambda-list (second boa))
+  (multiple-value-bind (llks req opt rest keys aux)
+      (parse-lambda-list (second boa)
+                         :accept
+                         (lambda-list-keyword-mask
+                            '(&optional &rest &key &allow-other-keys &aux)))
     (collect ((arglist)
               (vars)
               (skipped-vars)
@@ -1583,14 +1542,15 @@ or they must be declared locally notinline at each call site.~@:>")
                     (t
                      (do-default arg)))))
 
-          (when restp
-            (arglist '&rest rest)
-            (vars rest)
-            (ftype-args '&rest)
-            (arg-type t)
-            (decls `(type list ,rest)))
+          (when rest
+            (let ((rest (car rest)))
+              (arglist '&rest rest)
+              (vars rest)
+              (ftype-args '&rest)
+              (arg-type t)
+              (decls `(type list ,rest))))
 
-          (when keyp
+          (when (ll-kwds-keyp llks)
             (arglist '&key)
             (ftype-args '&key)
             (dolist (key keys)
@@ -1615,25 +1575,25 @@ or they must be declared locally notinline at each call site.~@:>")
                           (vars supplied-test)))))
                   (do-default key t))))
 
-          (when allowp
+          (when (ll-kwds-allowp llks)
             (arglist '&allow-other-keys)
             (ftype-args '&allow-other-keys))
 
-          (when auxp
+          ;; PARSE-LAMBDA-LIST doesn't distinguish between &AUX with nothing
+          ;; after it, and absence of &AUX. They mean the same thing, even as
+          ;; "interesting" as &AUX can be in a BOA lambda list [CLHS 3.4.6]
+          (when aux
             (arglist '&aux)
             (dolist (arg aux)
               (typecase arg
-                ((cons symbol (cons t null))
+                ((cons symbol cons)
                  (let ((var (first arg)))
                    (arglist arg)
                    (vars var)
                    (decls `(type ,(get-slot var) ,var))))
-                ((cons symbol null)
-                 (skipped-vars (first arg)))
-                (symbol
-                 (skipped-vars arg))
                 (t
-                 (error "Malformed &AUX binding specifier: ~s." arg)))))))
+                 ;; (&AUX X) and (&AUX (X)) both skip the slot
+                 (skipped-vars (if (consp arg) (first arg) arg))))))))
 
       (funcall creator defstruct (first boa)
                (arglist) (ftype-args) (decls)
@@ -1836,7 +1796,7 @@ or they must be declared locally notinline at each call site.~@:>")
     `(progn
 
       (eval-when (:compile-toplevel :load-toplevel :execute)
-        (%compiler-set-up-layout ',dd ',(inherits-for-structure dd))))))
+        (%compiler-set-up-layout ',dd ',(!inherits-for-structure dd))))))
 
 (sb!xc:proclaim '(special *defstruct-hooks*))
 
@@ -1869,8 +1829,8 @@ or they must be declared locally notinline at each call site.~@:>")
               :dd-type dd-type))
          (dd-slots (dd-slots dd))
          (dd-length (1+ (length slot-names)))
-         (object-gensym (sb!xc:gensym "OBJECT"))
-         (new-value-gensym (sb!xc:gensym "NEW-VALUE-"))
+         (object-gensym (make-symbol "OBJECT"))
+         (new-value-gensym (make-symbol "NEW-VALUE"))
          (delayed-layout-form `(%delayed-get-compiler-layout ,class-name)))
     (multiple-value-bind (raw-maker-form raw-reffer-operator)
         (ecase dd-type
@@ -1887,7 +1847,7 @@ or they must be declared locally notinline at each call site.~@:>")
       `(progn
 
          (eval-when (:compile-toplevel :load-toplevel :execute)
-           (%compiler-set-up-layout ',dd ',(inherits-for-structure dd)))
+           (%compiler-set-up-layout ',dd ',(!inherits-for-structure dd)))
 
          ;; slot readers and writers
          (declaim (inline ,@(mapcar #'dsd-accessor-name dd-slots)))
@@ -1915,14 +1875,9 @@ or they must be declared locally notinline at each call site.~@:>")
          (defun ,boa-constructor ,slot-names
            (let ((,object-gensym ,raw-maker-form))
              ,@(mapcar (lambda (slot-name)
-                         (let ((dsd (find (symbol-name slot-name) dd-slots
-                                          :key (lambda (x)
-                                                 (symbol-name (dsd-name x)))
-                                          :test #'string=)))
-                           ;; KLUDGE: bug 117 bogowarning.  Neither
-                           ;; DECLAREing the type nor TRULY-THE cut
-                           ;; the mustard -- it still gives warnings.
-                           (enforce-type dsd defstruct-slot-description)
+                         (let ((dsd (or (find slot-name dd-slots
+                                              :key #'dsd-name :test #'string=)
+                                        (bug "Bogus alt-metaclass boa ctor"))))
                            `(setf (,(dsd-accessor-name dsd) ,object-gensym)
                                   ,slot-name)))
                        slot-names)
@@ -1936,7 +1891,12 @@ or they must be declared locally notinline at each call site.~@:>")
              `(defun ,predicate (,object-gensym)
                 (typep ,object-gensym ',class-name)))
 
-         (aver (null *defstruct-hooks*))))))
+         ;; Usually we AVER instead of ASSERT, but one alternate-metaclass
+         ;; structure definition is cross-compiled before AVER is a known macro.
+         ;; It could be a def!macro perhaps, but ASSERT works just fine here
+         ;; without adding to image size, since these toplevel forms
+         ;; belong to code that is discarded after cold-init.
+         (assert (null *defstruct-hooks*))))))
 
 ;;;; finalizing bootstrapping
 
@@ -1950,10 +1910,6 @@ or they must be declared locally notinline at each call site.~@:>")
 (defun !set-up-structure-object-class ()
   (let ((dd (make-defstruct-description 'structure-object)))
     (setf
-     ;; Note: This has an ALTERNATE-METACLASS only because of blind
-     ;; clueless imitation of the CMU CL code -- dunno if or why it's
-     ;; needed. -- WHN
-     (dd-alternate-metaclass dd) '(t)
      (dd-slots dd) nil
      (dd-length dd) 1
      (dd-type dd) 'structure)
@@ -1968,7 +1924,7 @@ or they must be declared locally notinline at each call site.~@:>")
   (let* ((dd (parse-defstruct-name-and-options-and-slot-descriptions
               (first args)
               (rest args)))
-         (inherits (inherits-for-structure dd)))
+         (inherits (!inherits-for-structure dd)))
     (%compiler-defstruct dd inherits)))
 
 (defun find-defstruct-description (name &optional (errorp t))
@@ -1985,5 +1941,68 @@ or they must be declared locally notinline at each call site.~@:>")
     (and (listp info)
          (defstruct-slot-description-p (cdr info))
          info)))
+
+;;; These functions are required to emulate SBCL kernel functions
+;;; in a vanilla ANSI Common Lisp cross-compilation host.
+;;; The emulation doesn't need to be efficient, since it's needed
+;;; only for object dumping.
+#+sb-xc-host
+(progn
+  (defun xc-dumpable-structure-instance-p (x)
+    (and (typep x 'cl:structure-object)
+         (let ((name (type-of x)))
+           ;; Don't allow totally random structures, only ones that the
+           ;; cross-compiler has been advised will work.
+           (and (get name :sb-xc-allow-dumping-instances)
+                ;; but we must also have cross-compiled it for real.
+                (sb!kernel::compiler-layout-ready-p name)
+                ;; and I don't know anything about raw slots
+                ;; Coincidentally, in either representation of
+                ;; raw-slot-metadata, 0 represents no untagged slots.
+                (zerop (layout-raw-slot-metadata
+                        (info :type :compiler-layout name)))))))
+  (defun %instance-layout (instance)
+    (aver (or (typep instance 'structure!object)
+              (xc-dumpable-structure-instance-p instance)))
+    (classoid-layout (find-classoid (type-of instance))))
+  (defun %instance-length (instance)
+    ;; INSTANCE-LENGTH tells you how many data words the backend is able to
+    ;; physically access in this structure. Since every structure occupies
+    ;; an even number of words, the storage slots comprise an odd number
+    ;; of words after subtracting 1 for the header.
+    ;; And in fact the fasl dumper / loader do write and read potentially
+    ;; one cell beyond the instance's LAYOUT-LENGTH if it was not odd.
+    ;; I'm not sure whether that is a good or bad thing.
+    ;; But be that as it may, in the cross-compiler you must not access
+    ;; more cells than there are in the declared structure because there
+    ;; is no lower level storage that you can peek at.
+    ;; So INSTANCE-LENGTH is exactly the same as LAYOUT-LENGTH on the host.
+    (layout-length (%instance-layout instance)))
+  (defun %instance-ref (instance index)
+    (let ((layout (%instance-layout instance)))
+      ;; with compact headers, 0 is an ordinary slot index.
+      ;; without, it's the layout.
+      (if (eql index (1- sb!vm:instance-data-start))
+          (error "XC Host should use %INSTANCE-LAYOUT, not %INSTANCE-REF 0")
+          (let* ((dd (layout-info layout))
+                 ;; If data starts at 1, then subtract 1 from index.
+                 ;; otherwise use the index as-is.
+                 (dsd (elt (dd-slots dd)
+                           (- index sb!vm:instance-data-start)))
+                 (accessor-name (dsd-accessor-name dsd)))
+            ;; Why AVER these: because it is slightly abstraction-breaking
+            ;; to assume that the slot-index N is the NTH item in the DSDs.
+            ;; The target Lisp never assumes that.
+            (aver (and (eql (dsd-index dsd) index) (eq (dsd-raw-type dsd) t)))
+            (funcall accessor-name instance)))))
+  ;; Setting with (FUNCALL `(SETF ,accessor) ...) is unportable because
+  ;;  "The mechanism by which defstruct arranges for slot accessors to be
+  ;;   usable with setf is implementation-dependent; for example, it may
+  ;;   use setf functions, setf expanders, or some other
+  ;;   implementation-dependent mechanism ..."
+  ;; But such capability seems not to be needed.
+  (defun %instance-set (instance index new-value)
+    (declare (ignore instance index new-value))
+    (error "Can not use %INSTANCE-SET on cross-compilation host.")))
 
 (/show0 "code/defstruct.lisp end of file")

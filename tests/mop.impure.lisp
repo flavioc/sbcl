@@ -303,6 +303,7 @@
   ())
 (defmethod direct-slot-definition-class ((class auto-accessors-class)
                                          &rest initargs)
+  (declare (ignore initargs))
   (let ((dsd-class-name (gensym)))
     (sb-pcl:ensure-class
      dsd-class-name
@@ -311,6 +312,7 @@
      :containing-class-name (class-name class))
     (eval `(defmethod initialize-instance :after ((dsd ,dsd-class-name)
                                                   &rest args)
+            (declare (ignore args))
             (when (and (null (slot-definition-readers dsd))
                        (null (slot-definition-writers dsd)))
               (let* ((containing-class-name
@@ -554,6 +556,9 @@
 (with-test (:name :make-method-lambda-wrapping+return-from)
   (assert (eq :default (wrapped (cons t t)))))
 
+;; This test tests something a little shady - that a method
+;; are accessible by way of FDEFNs. They aren't all.
+;; See the comment in src/pcl/low.lisp at SET-FUN-NAME.
 (with-test (:name :slow-method-is-fboundp)
   (assert (fboundp '(sb-pcl::slow-method wrapped (cons))))
   (assert (eq :default (funcall #'(sb-pcl::slow-method wrapped (cons)) (list (cons t t)) nil))))
@@ -684,7 +689,7 @@
 (defgeneric definitely-a-funcallable-instance (x))
 (with-test (:name (set-funcallable-instance-function :typechecking))
   (assert-error (set-funcallable-instance-function
-                  (lambda (y) nil)
+                  (lambda (y) (declare (ignore y)) nil)
                   #'definitely-a-funcallable-instance)
                  type-error))
 

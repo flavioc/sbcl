@@ -28,7 +28,7 @@
 (declaim (ftype (sfunction (t list &optional t) lambda-var) varify-lambda-arg))
 (defun varify-lambda-arg (name names-so-far &optional (context "lambda list"))
   (declare (inline member))
-  (unless (symbolp name)
+  (unless (symbolp name) ;; FIXME: probably unreachable. Change to AVER?
     (compiler-error "~S is not a symbol, and cannot be used as a variable." name))
   (when (member name names-so-far :test #'eq)
     (compiler-error "The variable ~S occurs more than once in the ~A."
@@ -87,10 +87,8 @@
 (declaim (ftype (sfunction (list) (values list boolean boolean list list))
                 make-lambda-vars))
 (defun make-lambda-vars (list)
-  (multiple-value-bind (required optional restp rest keyp keys allowp auxp aux
-                        morep more-context more-count)
+  (multiple-value-bind (llks required optional rest/more keys aux)
       (parse-lambda-list list)
-    (declare (ignore auxp)) ; since we just iterate over AUX regardless
     (collect ((vars)
               (names-so-far)
               (aux-vars)
@@ -105,11 +103,7 @@
                           (supplied-var (varify-lambda-arg supplied-p
                                                            (names-so-far))))
                      (setf (arg-info-supplied-p info) supplied-var)
-                     (names-so-far supplied-p)
-                     (when (> (length (the list spec)) 3)
-                       (compiler-error
-                        "The list ~S is too long to be an arg specifier."
-                        spec)))))))
+                     (names-so-far supplied-p))))))
 
         (dolist (name required)
           (let ((var (varify-lambda-arg name (names-so-far))))
@@ -131,23 +125,14 @@
                 (names-so-far name)
                 (parse-default spec info))))
 
-        (when restp
-          (let ((var (varify-lambda-arg rest (names-so-far))))
-            (setf (lambda-var-arg-info var) (make-arg-info :kind :rest))
-            (vars var)
-            (names-so-far rest)))
-
-        (when morep
-          (let ((var (varify-lambda-arg more-context (names-so-far))))
-            (setf (lambda-var-arg-info var)
-                  (make-arg-info :kind :more-context))
-            (vars var)
-            (names-so-far more-context))
-          (let ((var (varify-lambda-arg more-count (names-so-far))))
-            (setf (lambda-var-arg-info var)
-                  (make-arg-info :kind :more-count))
-            (vars var)
-            (names-so-far more-count)))
+        (when rest/more
+          (mapc (lambda (name kind)
+                  (let ((var (varify-lambda-arg name (names-so-far))))
+                    (setf (lambda-var-arg-info var) (make-arg-info :kind kind))
+                    (vars var)
+                    (names-so-far name)))
+                rest/more (let ((morep (eq (ll-kwds-restp llks) '&more)))
+                            (if morep '(:more-context :more-count) '(:rest)))))
 
         (dolist (spec keys)
           (cond
@@ -172,8 +157,6 @@
               (parse-default spec info)))
            (t
             (let ((head (first spec)))
-              (unless (proper-list-of-length-p head 2)
-                (error "malformed &KEY argument specifier: ~S" spec))
               (let* ((name (second head))
                      (var (varify-lambda-arg name (names-so-far)))
                      (info (make-arg-info
@@ -187,22 +170,15 @@
                 (parse-default spec info))))))
 
         (dolist (spec aux)
-          (cond ((atom spec)
-                 (let ((var (varify-lambda-arg spec nil)))
-                   (aux-vars var)
-                   (aux-vals nil)
-                   (names-so-far spec)))
-                (t
-                 (unless (proper-list-of-length-p spec 1 2)
-                   (compiler-error "malformed &AUX binding specifier: ~S"
-                                   spec))
-                 (let* ((name (first spec))
-                        (var (varify-lambda-arg name nil)))
-                   (aux-vars var)
-                   (aux-vals (second spec))
-                   (names-so-far name)))))
+          (multiple-value-bind (name val)
+              (if (atom spec) spec (values (car spec) (cadr spec)))
+            (let ((var (varify-lambda-arg name nil)))
+              (aux-vars var)
+              (aux-vals val)
+              (names-so-far name))))
 
-        (values (vars) keyp allowp (aux-vars) (aux-vals))))))
+        (values (vars) (ll-kwds-keyp llks) (ll-kwds-allowp llks)
+                (aux-vars) (aux-vals))))))
 
 ;;; This is similar to IR1-CONVERT-PROGN-BODY except that we
 ;;; sequentially bind each AUX-VAR to the corresponding AUX-VAL before
@@ -970,9 +946,9 @@
   (multiple-value-bind (vars keyp allow-other-keys aux-vars aux-vals)
       (make-lambda-vars (cadr form))
     (multiple-value-bind (forms decls doc) (parse-body (cddr form))
-      (binding* (((*lexenv* result-type post-binding-lexenv)
+      (binding* (((*lexenv* result-type post-binding-lexenv lambda-list)
                   (process-decls decls (append aux-vars vars) nil
-                                 :binding-form-p t))
+                                 :binding-form-p t :allow-lambda-list t))
                  (debug-catch-p (and maybe-add-debug-catch
                                      *allow-instrumenting*
                                      (policy *lexenv*
@@ -1001,7 +977,10 @@
                                                       :debug-name debug-name
                                                       :system-lambda system-lambda)))))
         (setf (functional-inline-expansion res) form)
-        (setf (functional-arg-documentation res) (cadr form))
+        (setf (functional-arg-documentation res)
+              (if (eq lambda-list :unspecified)
+                  (strip-lambda-list (cadr form) :arglist)
+                  lambda-list))
         (setf (functional-documentation res) doc)
         (when (boundp '*lambda-conversions*)
           ;; KLUDGE: Not counting TL-XEPs is a lie, of course, but
@@ -1094,7 +1073,31 @@
                                 :source-name source-name
                                 :debug-name debug-name))))
 
-;;;; defining global functions
+;;; Convert the forms produced by RECONSTRUCT-LEXENV to LEXENV
+(defun process-inline-lexenv (inline-lexenv)
+  (labels ((recurse (inline-lexenv lexenv)
+             (let ((*lexenv* lexenv))
+               (if (null inline-lexenv)
+                   lexenv
+                   (destructuring-bind (type bindings &optional body) inline-lexenv
+                     (case type
+                       (:declare
+                        (recurse body
+                                 (process-decls `((declare ,@bindings)) nil nil)))
+                       (:macro
+                        (let ((macros (loop for (name . function) in bindings
+                                            collect (list* name 'macro
+                                                           (eval-in-lexenv function lexenv)))))
+                          (recurse body
+                                   (make-lexenv :default lexenv
+                                                :funs macros))))
+                       (:symbol-macro
+                        (funcall-in-symbol-macrolet-lexenv bindings
+                                                           (lambda (&rest args)
+                                                             (declare (ignore args))
+                                                             (recurse body *lexenv*))
+                                                           :compile))))))))
+    (recurse inline-lexenv (make-null-lexenv))))
 
 ;;; Convert FUN as a lambda in the null environment, but use the
 ;;; current compilation policy. Note that FUN may be a
@@ -1107,56 +1110,44 @@
                                   system-lambda)
   (when (and (not debug-name) (eq '.anonymous. source-name))
     (setf debug-name (name-lambdalike fun)))
-  (destructuring-bind (decls macros symbol-macros &rest body)
-      (if (eq (car fun) 'lambda-with-lexenv)
-          (cdr fun)
-          `(() () () . ,(cdr fun)))
-    (let* ((*lexenv* (make-lexenv
-                      :default (process-decls decls nil nil
-                                              :lexenv (make-null-lexenv))
-                      :vars (copy-list symbol-macros)
-                      :funs (mapcar (lambda (x)
-                                      `(,(car x) .
-                                         (macro . ,(coerce (cdr x) 'function))))
-                                    macros)
-                      ;; Inherit MUFFLE-CONDITIONS from the call-site lexenv
-                      ;; rather than the definition-site lexenv, since it seems
-                      ;; like a much more common case.
-                      :handled-conditions (lexenv-handled-conditions *lexenv*)
-                      :policy (lexenv-policy *lexenv*)))
-           (clambda (ir1-convert-lambda `(lambda ,@body)
-                                        :source-name source-name
-                                        :debug-name debug-name
-                                        :system-lambda system-lambda)))
-      (setf (functional-inline-expanded clambda) t)
-      clambda)))
-
+  (let* ((lambda-with-lexenv-p (eq (car fun) 'lambda-with-lexenv))
+         (body (if lambda-with-lexenv-p
+                   `(lambda ,@(cddr fun))
+                   fun))
+         (*lexenv* (make-lexenv
+                    :default (if lambda-with-lexenv-p
+                                 (process-inline-lexenv (second fun))
+                                 (make-null-lexenv))
+                    ;; Inherit MUFFLE-CONDITIONS from the call-site lexenv
+                    ;; rather than the definition-site lexenv, since it seems
+                    ;; like a much more common case.
+                    :handled-conditions (lexenv-handled-conditions *lexenv*)
+                    :policy (lexenv-policy *lexenv*)))
+         (clambda (ir1-convert-lambda body
+                                      :source-name source-name
+                                      :debug-name debug-name
+                                      :system-lambda system-lambda)))
+    (setf (functional-inline-expanded clambda) t)
+    clambda))
+;;;; defining global functions
 ;;; Given a lambda-list, return a FUN-TYPE object representing the signature:
 ;;; return type is *, and each individual arguments type is T -- but we get
 ;;; the argument counts and keywords.
 (defun ftype-from-lambda-list (lambda-list)
-  (multiple-value-bind (req opt restp rest-name keyp key-list allowp morep)
+  (multiple-value-bind (llks req opt rest key-list)
       (parse-lambda-list lambda-list)
-    (declare (ignore rest-name))
-    (flet ((t (list)
-             (mapcar (constantly t) list)))
-      (let ((reqs (t req))
-            (opts (when opt (cons '&optional (t opt))))
+    (flet ((list-of-t (list) (mapcar (constantly t) list)))
+      (let ((reqs (list-of-t req))
+            (opts (when opt (cons '&optional (list-of-t opt))))
             ;; When it comes to building a type, &REST means pretty much the
             ;; same thing as &MORE.
-            (rest (when (or morep restp) (list '&rest t)))
-            (keys (when keyp
+            (rest (when rest '(&rest t)))
+            (keys (when (ll-kwds-keyp llks)
                     (cons '&key (mapcar (lambda (spec)
-                                          (let ((key/var (if (consp spec)
-                                                             (car spec)
-                                                             spec)))
-                                            (list (if (consp key/var)
-                                                      (car key/var)
-                                                      (keywordicate key/var))
-                                                  t)))
+                                          (list (parse-key-arg-spec spec) t))
                                         key-list))))
-            (allow (when allowp (list '&allow-other-keys))))
-        (specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
+            (allow (when (ll-kwds-allowp llks) '(&allow-other-keys))))
+        (compiler-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
 
 ;;; Get a DEFINED-FUN object for a function we are about to define. If
 ;;; the function has been forward referenced, then substitute for the

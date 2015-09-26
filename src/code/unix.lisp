@@ -608,7 +608,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
        (format *debug-io*
                "~&=== Starting a ~A without a timeout while interrupts are disabled. ===~%"
                type)
-       (sb!debug:backtrace)))
+       (sb!debug:print-backtrace)))
     nil))
 
 ;;;; poll.h
@@ -947,6 +947,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 #!-win32
 (defun nanosleep (secs nsecs)
+  (declare (optimize (sb!c:alien-funcall-saves-fp-and-pc 0)))
   (with-alien ((req (struct timespec))
                (rem (struct timespec)))
     (setf (slot req 'tv-sec) secs

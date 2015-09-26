@@ -71,7 +71,7 @@
 (defun allocate-standard-funcallable-instance
     (wrapper &optional (slots-init nil slots-init-p))
   (let ((fin (%make-standard-funcallable-instance
-              nil nil (get-instance-hash-code))))
+              nil (get-instance-hash-code))))
     (set-funcallable-instance-function
      fin
      #'(lambda (&rest args)
@@ -507,16 +507,6 @@
     (dolist (writer writers) (do-writer-definition writer))
     (dolist (boundp boundps) (do-boundp-definition boundp))))
 
-;;; FIXME: find a better name.
-(defun !bootstrap-class-predicates (early-p)
-  (let ((*early-p* early-p)
-        (source-loc (sb-c:source-location)))
-    (dolist (ecp *!early-class-predicates*)
-      (let ((class-name (car ecp))
-            (predicate-name (cadr ecp)))
-        (!make-class-predicate (find-class class-name) predicate-name
-                               source-loc)))))
-
 (defun !bootstrap-built-in-classes ()
 
   ;; First make sure that all the supers listed in
@@ -667,24 +657,9 @@
         (when (and name (symbolp name) (eq name (classoid-name classoid)))
           (setf (find-classoid name) classoid))))))
 
-(defun %set-class-type-translation (class classoid)
-  (when (not (typep classoid 'classoid))
-    (setq classoid (find-classoid classoid nil)))
-  (etypecase classoid
-    (null)
-    (classoid
-     ;; There used to be an AVER preventing the placeholder :INITIALIZING from
-     ;; sneaking into globaldb. It can't any more due to type-safe (SETF INFO).
-     (setf (info :type :translator class)
-           (or (and (typep classoid 'built-in-classoid)
-                    (built-in-classoid-translation classoid))
-               classoid)))))
-
 (!bootstrap-meta-braid)
 (!bootstrap-accessor-definitions t)
-(!bootstrap-class-predicates t)
 (!bootstrap-accessor-definitions nil)
-(!bootstrap-class-predicates nil)
 (!bootstrap-built-in-classes)
 
 (loop for (name . x)
@@ -711,7 +686,7 @@
             (t
              (setf (find-classoid name) lclass)))
 
-      (%set-class-type-translation class name))))
+      )))
 
 (setq **boot-state** 'braid)
 

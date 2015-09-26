@@ -18,19 +18,28 @@
 (defknown coerce (t type-specifier) t
     ;; Note:
     ;; This is not FLUSHABLE because it's defined to signal errors.
-    (movable)
+    (movable explicit-check)
   ;; :DERIVE-TYPE RESULT-TYPE-SPEC-NTH-ARG 2 ? Nope... (COERCE 1 'COMPLEX)
   ;; returns REAL/INTEGER, not COMPLEX.
   )
-(defknown list-to-vector* (list type-specifier) vector)
-(defknown vector-to-vector* (vector type-specifier) vector)
+;; These each check their input sequence for type-correctness,
+;; but not the output type specifier, because MAKE-SEQUENCE will do that.
+(defknown list-to-vector* (list type-specifier) vector (explicit-check))
+(defknown vector-to-vector* (vector type-specifier) vector (explicit-check))
 
-(defknown type-of (t) t (foldable flushable))
+;; FIXME: Is this really FOLDABLE? A counterexample seems to be:
+;;  (LET ((S :S)) (VALUES (TYPE-OF S) (UNINTERN S 'KEYWORD) (TYPE-OF S) S))
+;; Anyway, the TYPE-SPECIFIER type is more inclusive than the actual
+;; possible return values. Most of the time it will be (OR LIST SYMBOL).
+;; CLASS can be returned only when you've got an object whose class-name
+;; does not properly name its class.
+(defknown type-of (t) (or list symbol class)
+  (foldable flushable explicit-check))
 
 ;;; These can be affected by type definitions, so they're not FOLDABLE.
 (defknown (sb!xc:upgraded-complex-part-type sb!xc:upgraded-array-element-type)
-    (type-specifier &optional lexenv-designator) type-specifier
-    (unsafely-flushable))
+    (type-specifier &optional lexenv-designator) (or list symbol)
+    (unsafely-flushable explicit-check))
 
 ;;;; from the "Predicates" chapter:
 
@@ -58,7 +67,7 @@
    ;;
    ;; (UPGRADED-ARRAY-ELEMENT-TYPE and UPGRADED-COMPLEX-PART-TYPE have
    ;; behavior like SUBTYPEP in this respect, not like TYPEP.)
-   (foldable))
+   (foldable explicit-check))
 (defknown subtypep (type-specifier type-specifier &optional lexenv-designator)
   (values boolean boolean)
   ;; This is not FOLDABLE because its value is affected by type
@@ -66,12 +75,12 @@
   ;;
   ;; FIXME: Is it OK to fold this when the types have already been
   ;; defined? Does the code inherited from CMU CL already do this?
-  (unsafely-flushable))
+  (unsafely-flushable explicit-check))
 
 (defknown (null symbolp atom consp listp numberp integerp rationalp floatp
                 complexp characterp stringp bit-vector-p vectorp
                 simple-vector-p simple-string-p simple-bit-vector-p arrayp
-                sb!xc:packagep functionp compiled-function-p not)
+                packagep functionp compiled-function-p not)
   (t) boolean (movable foldable flushable))
 
 (defknown (eq eql %eql/integer) (t t) boolean
@@ -85,7 +94,7 @@
 
 ;;;; classes
 
-(sb!xc:deftype name-for-class () t)
+(sb!xc:deftype name-for-class () t) ; FIXME: disagrees w/ LEGAL-CLASS-NAME-P
 (defknown classoid-name (classoid) symbol (flushable))
 (defknown find-classoid (name-for-class &optional t)
   (or classoid null) ())
@@ -175,7 +184,7 @@
 (defknown %make-symbol (simple-string) symbol (flushable))
 (defknown copy-symbol (symbol &optional t) symbol (flushable))
 (defknown gensym (&optional (or string unsigned-byte)) symbol ())
-(defknown symbol-package (symbol) (or sb!xc:package null) (flushable))
+(defknown symbol-package (symbol) (or package null) (flushable))
 (defknown keywordp (t) boolean (flushable))       ; If someone uninterns it...
 
 ;;;; from the "Packages" chapter:
@@ -188,16 +197,16 @@
                                           ;; ### extensions...
                                           (:internal-symbols index)
                                           (:external-symbols index))
-  sb!xc:package)
-(defknown find-package (package-designator) (or sb!xc:package null)
+  package)
+(defknown find-package (package-designator) (or package null)
   (flushable))
 (defknown find-undeleted-package-or-lose (package-designator)
-  sb!xc:package) ; not flushable
+  package) ; not flushable
 (defknown package-name (package-designator) (or simple-string null)
   (unsafely-flushable))
 (defknown package-nicknames (package-designator) list (unsafely-flushable))
 (defknown rename-package (package-designator package-designator &optional list)
-  sb!xc:package)
+  package)
 (defknown package-use-list (package-designator) list (unsafely-flushable))
 (defknown package-used-by-list (package-designator) list (unsafely-flushable))
 (defknown package-shadowing-symbols (package-designator) list (unsafely-flushable))
@@ -501,11 +510,11 @@
                                         &key
                                         (:initial-element t))
   consed-sequence
-  (movable)
+  (movable explicit-check)
   :derive-type (creation-result-type-specifier-nth-arg 1))
 
 (defknown concatenate (type-specifier &rest sequence) consed-sequence
-  ()
+  (explicit-check)
   :derive-type (creation-result-type-specifier-nth-arg 1))
 
 (defknown %concatenate-to-string (&rest sequence) simple-string
@@ -513,21 +522,33 @@
 (defknown %concatenate-to-base-string (&rest sequence) simple-base-string
   (explicit-check flushable))
 
-(defknown (map %map) (type-specifier callable sequence &rest sequence)
-  consed-sequence
-  (call)
+(defknown map (type-specifier callable sequence &rest sequence)
+  consed-sequence (call explicit-check)
 ; :DERIVE-TYPE 'TYPE-SPEC-ARG1 ? Nope... (MAP NIL ...) returns NULL, not NIL.
   )
-(defknown %map-for-effect-arity-1 (callable sequence) null (call))
-(defknown %map-to-list-arity-1 (callable sequence) list (flushable call))
+(defknown %map (type-specifier callable &rest sequence)
+  consed-sequence (call explicit-check))
+(defknown %map-for-effect-arity-1 (callable sequence) null
+  (call explicit-check))
+(defknown %map-to-list-arity-1 (callable sequence) list
+  (flushable call explicit-check))
 (defknown %map-to-simple-vector-arity-1 (callable sequence) simple-vector
-  (flushable call))
+  (flushable call explicit-check))
 
 (defknown map-into (sequence callable &rest sequence)
   sequence
   (call)
   :derive-type #'result-type-first-arg
   :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+
+(defknown #.(loop for info across sb!vm:*specialized-array-element-type-properties*
+                  collect
+                  (intern (concatenate 'string "VECTOR-MAP-INTO/"
+                                       (string (sb!vm:saetp-primitive-type-name info)))
+                          :sb!impl))
+    (simple-array index index function list)
+    index
+    (call explicit-check))
 
 ;;; returns the result from the predicate...
 (defknown some (callable sequence &rest sequence) t
@@ -710,7 +731,7 @@
 (defknown merge (type-specifier sequence sequence callable
                                 &key (:key callable))
   sequence
-  (call important-result)
+  (call important-result explicit-check)
   :derive-type (creation-result-type-specifier-nth-arg 1)
   :destroyed-constant-args (nth-constant-nonempty-sequence-args 2 3))
 
@@ -935,8 +956,7 @@
 (defknown aref (array &rest index) t (foldable))
 (defknown row-major-aref (array index) t (foldable))
 
-(defknown array-element-type (array)
-  type-specifier
+(defknown array-element-type (array) (or list symbol)
   (foldable flushable recursive))
 (defknown array-rank (array) array-rank (foldable flushable))
 ;; FIXME: there's a fencepost bug, but for all practical purposes our
@@ -1020,7 +1040,7 @@
 
 (defknown make-string (index &key (:element-type type-specifier)
                        (:initial-element character))
-  simple-string (flushable))
+  simple-string (flushable explicit-check))
 
 (defknown (string-trim string-left-trim string-right-trim)
   (sequence string-designator) string (flushable))
@@ -1066,12 +1086,11 @@
   stream
   (flushable))
 (defknown make-string-output-stream
-    (&key (:element-type type-specifier))
-    string-output-stream
-  (flushable))
+    (&key (:element-type type-specifier)) sb!impl::string-output-stream
+  (flushable explicit-check))
 (defknown get-output-stream-string (stream) simple-string ())
 (defknown streamp (t) boolean (movable foldable flushable))
-(defknown stream-element-type (stream) type-specifier
+(defknown stream-element-type (stream) type-specifier ; can it return a CLASS?
   (movable foldable flushable))
 (defknown stream-external-format (stream) t (flushable))
 (defknown (output-stream-p input-stream-p) (stream) boolean
@@ -1145,7 +1164,7 @@
   (type-specifier (or null callable)
    &optional real sb!pretty:pprint-dispatch-table)
   null
-  ())
+  (explicit-check))
 
 ;;; may return any type due to eof-value...
 ;;; and because READ generally returns anything.
@@ -1197,9 +1216,8 @@
   (any explicit-check)
   :derive-type #'result-type-first-arg)
 
-(defknown output-object (t stream)
-  null
-  (any explicit-check))
+(defknown output-object (t stream) null (any explicit-check))
+(defknown %write (t stream-designator) t (any explicit-check))
 
 (defknown (pprint) (t &optional stream-designator) (values)
   (explicit-check))
@@ -1407,7 +1425,7 @@
 (defknown warn (t &rest t) null)
 (defknown invoke-debugger (condition) nil)
 (defknown break (&optional format-control &rest t) null)
-(defknown make-condition (type-specifier &rest t) condition)
+(defknown make-condition (type-specifier &rest t) condition (explicit-check))
 (defknown compute-restarts (&optional (or condition null)) list)
 (defknown find-restart (restart-designator &optional (or condition null))
   (or restart null))
@@ -1710,8 +1728,6 @@
 (defknown %check-vector-sequence-bounds (vector index sequence-end)
   index
   (unwind))
-
-(defknown arg-count-error (t t t t t t) nil ())
 
 ;;;; SETF inverses
 

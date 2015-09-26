@@ -14,29 +14,7 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (sb!xc:proclaim '(sb!ext:always-bound *current-thread*)))
 
-(def!type thread-name ()
-  'simple-string)
-
-(def!struct (thread (:constructor %make-thread))
-  #!+sb-doc
-  "Thread type. Do not rely on threads being structs as it may change
-in future versions."
-  (name          nil :type (or thread-name null))
-  (%alive-p      nil :type boolean)
-  (%ephemeral-p  nil :type boolean)
-  (os-thread     0 :type sb!vm:word)
-  (interruptions nil :type list)
-  ;; On succesful execution of the thread's lambda a list of values.
-  (result 0)
-  (interruptions-lock
-   (make-mutex :name "thread interruptions lock")
-   :type mutex)
-  (result-lock
-   (make-mutex :name "thread result lock")
-   :type mutex)
-  waiting-for)
-
-(def!struct (foreign-thread
+(defstruct (foreign-thread
              (:include thread)
              (:conc-name "THREAD-"))
   #!+sb-doc
@@ -44,22 +22,12 @@ in future versions."
 temporarily.")
 
 #!+(and sb-safepoint-strictly (not win32))
-(def!struct (signal-handling-thread
+(defstruct (signal-handling-thread
              (:include foreign-thread)
              (:conc-name "THREAD-"))
   #!+sb-doc
   "Asynchronous signal handling thread."
   (signal-number nil :type integer))
-
-(declaim (inline make-mutex)) ;; for possible DX-allocating
-(def!struct mutex
-  #!+sb-doc
-  "Mutex type."
-  (name   nil :type (or null thread-name))
-  (%owner nil :type (or null thread))
-  #!+(and sb-thread sb-futex)
-  (state    0 :type fixnum))
-(declaim (notinline make-mutex))
 
 (defun mutex-value (mutex)
   #!+sb-doc
@@ -76,24 +44,19 @@ stale value, use MUTEX-OWNER instead."
 
 (defsetf mutex-value set-mutex-value)
 
-(declaim (inline set-mutex-value))
-(defun set-mutex-value (mutex value)
-  (declare (ignore mutex value))
-  (error "~S is no longer supported." '(setf mutex-value)))
-
-(define-compiler-macro set-mutex-value (&whole form mutex value)
-  (declare (ignore mutex value))
-  (warn "~S is no longer supported, and will signal an error at runtime."
-        '(setf mutex-value))
-  form)
+#-sb-xc-host
+(declaim (sb!ext:deprecated :final ("SBCL" "1.2.15") #'set-mutex-value))
 
 ;;; SPINLOCK no longer exists as a type -- provided for backwards compatibility.
 
 (deftype spinlock ()
   #!+sb-doc
   "Spinlock type."
-  (deprecation-warning :early "1.0.53.11" 'spinlock 'mutex)
   'mutex)
+
+#-sb-xc-host
+(declaim (sb!ext:deprecated
+          :late ("SBCL" "1.0.53.11") (type spinlock :replacement mutex)))
 
 (define-deprecated-function :early "1.0.53.11" make-spinlock make-mutex (&key name)
   (make-mutex :name name))
@@ -114,14 +77,18 @@ stale value, use MUTEX-OWNER instead."
   (release-mutex lock))
 
 (sb!xc:defmacro with-recursive-spinlock ((lock) &body body)
-  (deprecation-warning :early "1.0.53.11" 'with-recursive-spinlock 'with-recursive-lock)
   `(with-recursive-lock (,lock)
      ,@body))
 
 (sb!xc:defmacro with-spinlock ((lock) &body body)
-  (deprecation-warning :early "1.0.53.11" 'with-spinlock 'with-mutex)
   `(with-mutex (,lock)
      ,@body))
+
+#-sb-xc-host
+(declaim (sb!ext:deprecated
+          :early ("SBCL" "1.0.53.11")
+          (function with-recursive-spinlock :replacement with-recursive-lock)
+          (function with-spinlock :replacement with-mutex)))
 
 (sb!xc:defmacro without-thread-waiting-for ((&key already-without-interrupts) &body body)
   (with-unique-names (thread prev)
@@ -159,7 +126,7 @@ and the MUTEX is not immediately available, sleep until it is available.
 If TIMEOUT is given, it specifies a relative timeout, in seconds, on how long
 the system should try to acquire the lock in the contested case.
 
-If the mutex isn't acquired succesfully due to either WAIT-P or TIMEOUT, the
+If the mutex isn't acquired successfully due to either WAIT-P or TIMEOUT, the
 body is not executed, and WITH-MUTEX returns NIL.
 
 Otherwise body is executed with the mutex held by current thread, and
@@ -200,7 +167,7 @@ held by the current thread, sleep until it is available.
 If TIMEOUT is given, it specifies a relative timeout, in seconds, on how long
 the system should try to acquire the lock in the contested case.
 
-If the mutex isn't acquired succesfully due to either WAIT-P or TIMEOUT, the
+If the mutex isn't acquired successfully due to either WAIT-P or TIMEOUT, the
 body is not executed, and WITH-RECURSIVE-LOCK returns NIL.
 
 Otherwise body is executed with the mutex held by current thread, and

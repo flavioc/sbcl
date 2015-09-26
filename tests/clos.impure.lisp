@@ -48,6 +48,7 @@
 ;;; broken in such a way that the code here would signal an error.
 (defgeneric zut-n-a-m (a b c))
 (defmethod no-applicable-method ((zut-n-a-m (eql #'zut-n-a-m)) &rest args)
+  (declare (ignore args))
   :no-applicable-method)
 (with-test (:name no-applicable-method)
   (assert (eq :no-applicable-method (zut-n-a-m 1 2 3))))
@@ -59,6 +60,8 @@
 ;;; DEFGENERIC and DEFMETHOD shouldn't accept &REST when it's not
 ;;; followed by a variable:
 ;;; e.g. (DEFMETHOD FOO ((X T) &REST) NIL) should signal an error.
+;;; Of course most of these are totally redundant
+;;; now that there is only one function to parse all lambda lists.
 (eval-when (:load-toplevel :compile-toplevel :execute)
   (defmacro expect-error (&body body)
     `(multiple-value-bind (res condition)
@@ -113,21 +116,21 @@
     (test-case '(x))
     ;; forbidden default or supplied-p for &OPTIONAL or &KEY arguments
     (test-case '(x &optional (y 0))
-               t t "invalid (Y 0) in the generic function lambda list")
+               t t "invalid &OPTIONAL argument specifier (Y 0)")
     (test-case '(x &optional y))
     (test-case '(x y &key (z :z z-p))
-               t t "invalid (Z :Z Z-P) in the generic function lambda list")
+               t t "invalid &KEY argument specifier (Z :Z Z-P)")
     (test-case '(x y &key z))
     (test-case '(x &optional (y 0) &key z)
-               t t "invalid (Y 0) in the generic function lambda list")
+               t t "invalid &OPTIONAL argument specifier (Y 0)")
     (test-case '(x &optional y &key z)
                nil t "&OPTIONAL and &KEY found in the same lambda list")
     (test-case '(x &optional y &key (z :z))
-               t t "invalid (Z :Z) in the generic function lambda list")
+               t t "invalid &KEY argument specifier (Z :Z)")
     (test-case '(x &optional y &key z)
                nil t "&OPTIONAL and &KEY found in the same lambda list")
     (test-case '(&optional &key (k :k k-p))
-               t t "invalid (K :K K-P)")
+               t t "invalid &KEY argument specifier (K :K K-P)")
     (test-case '(&optional &key k))
     ;; forbidden &AUX
     (test-case '(x y z &optional a &aux g h)
@@ -598,6 +601,7 @@
 (defmethod no-next-method-test ((x integer)) (call-next-method))
 (assert (null (ignore-errors (no-next-method-test 1))))
 (defmethod no-next-method ((g (eql #'no-next-method-test)) m &rest args)
+  (declare (ignore args))
   'success)
 (assert (eq (no-next-method-test 1) 'success))
 (assert (null (ignore-errors (no-next-method-test 'foo))))
@@ -911,6 +915,7 @@
   (reinitialize-instance (make-instance 'subclass234) :dummy 0))
 (assert-error (bug-234) program-error)
 (defmethod shared-initialize :after ((i class234) slots &key dummy)
+  (declare (ignore dummy))
   (incf *bug234*))
 (assert (typep (subbug-234) 'subclass234))
 (assert (= *bug234*
@@ -941,17 +946,46 @@
 (defmethod slot-missing (class (o class-with-all-slots-missing)
                          slot-name op
                          &optional new-value)
-  op)
-(assert (eq (slot-value (make-instance 'class-with-all-slots-missing) 'foo)
-            'slot-value))
-(assert (eq (funcall (lambda (x) (slot-value x 'bar))
-                     (make-instance 'class-with-all-slots-missing))
-            'slot-value))
-(assert (eq (funcall (lambda (x) (setf (slot-value x 'baz) 'baz))
-                     (make-instance 'class-with-all-slots-missing))
+  (declare (ignore new-value))
+  (values op 1 2 3))
+
+(with-test (:name :slot-value-missing)
+  (assert (equal (multiple-value-list
+                  (slot-value (make-instance 'class-with-all-slots-missing) 'foo))
+                 '(slot-value)))
+  (assert (equal (multiple-value-list
+                  (funcall (lambda (x) (slot-value x 'bar))
+                           (make-instance 'class-with-all-slots-missing)))
+                 '(slot-value))))
+
+(with-test (:name :slot-boundp-missing)
+  (assert (equal (multiple-value-list
+                  (slot-boundp (make-instance 'class-with-all-slots-missing) 'foo))
+                 '(t)))
+  (assert (equal (multiple-value-list
+                  (funcall (lambda (x) (slot-boundp x 'bar))
+                           (make-instance 'class-with-all-slots-missing)))
+                 '(t))))
+
+(with-test (:name :slot-setf-missing)
+  (assert (equal (multiple-value-list
+                  (setf (slot-value (make-instance 'class-with-all-slots-missing) 'foo) 10))
+                 '(10)))
+  (assert (equal (multiple-value-list
+                  (funcall (lambda (x) (setf (slot-value x 'bar) 20))
+                           (make-instance 'class-with-all-slots-missing)))
+                 '(20))))
+
+(macrolet ((try (which)
+             `(assert (eq ((lambda (x)
+                             (declare (,which sb-pcl::set-slot-value))
+                             (setf (slot-value x 'b) 'baz))
+                           (make-instance 'class-with-all-slots-missing))
             ;; SLOT-MISSING's value is specified to be ignored; we
             ;; return NEW-VALUE.
-            'baz))
+                          'baz))))
+  (try inline)
+  (try notinline))
 
 ;;; we should be able to specialize on anything that names a class.
 (defclass name-for-class () ())
@@ -1129,6 +1163,7 @@
 (defclass yet-another-obsoletion-sub (yet-another-obsoletion-super) ())
 (defmethod shared-initialize :after ((i yet-another-obsoletion-super)
                                      slots &rest init)
+  (declare (ignore init))
   (incf (obs-of i)))
 
 (defvar *yao-super* (make-instance 'yet-another-obsoletion-super))
@@ -2092,6 +2127,7 @@
 
 (defmethod initialize-instance :after
     ((class cacheing-initargs-redefinitions-check) &key slot)
+  (declare (ignore slot))
   nil)
 
 (with-test (:name (make-instance :initargs-checking-new-method-initargs))

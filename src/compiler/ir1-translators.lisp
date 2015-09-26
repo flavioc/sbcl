@@ -291,14 +291,20 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
                                        definitionize-keyword
                                        definitions
                                        fun)
-  (declare (type function definitionize-fun fun))
-  (declare (type (member :vars :funs) definitionize-keyword))
-  (declare (type list definitions))
-  (unless (= (length definitions)
-             (length (remove-duplicates definitions :key #'first)))
-    (compiler-style-warn "duplicate definitions in ~S" definitions))
+  (declare (type function definitionize-fun fun)
+           (type (member :vars :funs) definitionize-keyword))
+  (unless (listp definitions)
+    (compiler-error "Malformed ~s definitions: ~s"
+                    (case definitionize-keyword
+                      (:vars 'symbol-macrolet)
+                      (:funs 'macrolet))
+                    definitions))
   (let* ((processed-definitions (mapcar definitionize-fun definitions))
          (*lexenv* (make-lexenv definitionize-keyword processed-definitions)))
+    ;; Do this after processing, since the definitions can be malformed.
+    (unless (= (length definitions)
+               (length (remove-duplicates definitions :key #'first)))
+      (compiler-style-warn "Duplicate definitions in ~S" definitions))
     ;; I wonder how much of an compiler performance penalty this
     ;; non-constant keyword is.
     (funcall fun definitionize-keyword processed-definitions)))
@@ -330,18 +336,11 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
         (unless (listp arglist)
           (fail "The local macro argument list ~S is not a list."
                 arglist))
-        (with-unique-names (whole environment)
-          (multiple-value-bind (body local-decls)
-              (parse-defmacro arglist whole body name 'macrolet
-                              :environment environment)
-            `(,name macro .
-                    ,(compile-in-lexenv
-                      nil
-                      `(lambda (,whole ,environment)
-                         ,@(macro-policy-decls t)
-                         ,@local-decls
-                         ,body)
-                      lexenv))))))))
+        `(,name macro .
+                ,(compile-in-lexenv
+                  nil
+                  (make-macro-lambda nil arglist body 'macrolet name)
+                  lexenv))))))
 
 (defun funcall-in-macrolet-lexenv (definitions fun context)
   (%funcall-in-foomacrolet-lexenv
@@ -495,20 +494,10 @@ Return VALUE without evaluating it."
                                      (neq :catch (cleanup-kind (entry-cleanup (pop b)))))))
                             (lexenv-blocks *lexenv*) :from-end t))
               *source-namestring*
-              #+sb-xc-host
-              (progn
-                (aver (not *compile-file-truename*))
-                (aver (string= (pathname-name *load-truename*) "compile-cold-sbcl"))
-                ;; FIXME: the fact that this is what it is is probably
-                ;; more a reflection of a bug in genesis (not binding
-                ;; *LOAD-TRUENAME* to something sensible) rather than
-                ;; something useful (lambdas created at genesis time
-                ;; being given names referring to
-                ;; compile-cold-sbcl.lisp)
-                "SYS:SRC;COLD;COMPILE-COLD-SBCL.LISP")
-              #-sb-xc-host
-              (let ((p (or *compile-file-truename* *load-truename*)))
-                (when p (namestring p))))))
+              (let* ((p (or sb!xc:*compile-file-truename* *load-truename*)))
+                (when p
+                  #+sb-xc-host (lpnify-namestring (namestring p) (pathname-directory p) (pathname-type p))
+                  #-sb-xc-host (namestring p))))))
     (when context
       (list :in context))))
 
@@ -517,9 +506,9 @@ Return VALUE without evaluating it."
   (case (car thing)
     ((named-lambda)
      (or (second thing)
-         `(lambda ,(third thing) ,(name-context))))
+         `(lambda ,(strip-lambda-list (third thing) :name) ,(name-context))))
     ((lambda)
-     `(lambda ,(second thing) ,@(name-context)))
+     `(lambda ,(strip-lambda-list (second thing) :name) ,@(name-context)))
     ((lambda-with-lexenv)
      ;; FIXME: Get the original DEFUN name here.
      `(lambda ,(fifth thing)))
@@ -629,23 +618,16 @@ be a lambda expression."
 (def-ir1-translator %funcall ((function &rest args) start next result)
   ;; MACROEXPAND so that (LAMBDA ...) forms arriving here don't get an
   ;; extra cast inserted for them.
-  (let* ((function (%macroexpand function *lexenv*))
-         (op (when (consp function) (car function))))
-    (cond ((eq op 'function)
-           (compiler-destructuring-bind (thing) (cdr function)
-               function
-             (with-fun-name-leaf (leaf thing start)
-               (ir1-convert start next result `(,leaf ,@args)))))
-          ((eq op 'global-function)
-           (compiler-destructuring-bind (thing) (cdr function)
-               global-function
-             (with-fun-name-leaf (leaf thing start :global-function t)
-               (ir1-convert start next result `(,leaf ,@args)))))
-          (t
-           (let ((ctran (make-ctran))
-                 (fun-lvar (make-lvar)))
-             (ir1-convert start ctran fun-lvar `(the function ,function))
-             (ir1-convert-combination-args fun-lvar ctran next result args))))))
+  (let ((function (%macroexpand function *lexenv*)))
+    (if (typep function '(cons (member function global-function) (cons t null)))
+        (with-fun-name-leaf (leaf (cadr function) start
+                                  :global-function (eq (car function)
+                                                       'global-function))
+          (ir1-convert start next result `(,leaf ,@args)))
+        (let ((ctran (make-ctran))
+              (fun-lvar (make-lvar)))
+          (ir1-convert start ctran fun-lvar `(the function ,function))
+          (ir1-convert-combination-args fun-lvar ctran next result args)))))
 
 ;;; This source transform exists to reduce the amount of work for the
 ;;; compiler. If the called function is a FUNCTION form, then convert
@@ -844,6 +826,8 @@ not enclose the definitions; any use of NAME in the FORMS will refer to the
 lexically apparent function definition in the enclosing environment."
   (multiple-value-bind (forms decls)
       (parse-body body :doc-string-allowed nil)
+    (unless (listp definitions)
+      (compiler-error "Malformed FLET definitions: ~s" definitions))
     (multiple-value-bind (names defs)
         (extract-flet-vars definitions 'flet)
       (let ((fvars (mapcar (lambda (n d)
@@ -865,6 +849,8 @@ Evaluate the BODY-FORMS with local function definitions. The bindings enclose
 the new definitions, so the defined functions can call themselves or each
 other."
   (multiple-value-bind (forms decls) (parse-body body :doc-string-allowed nil)
+    (unless (listp definitions)
+      (compiler-error "Malformed LABELS definitions: ~s" definitions))
     (multiple-value-bind (names defs)
         (extract-flet-vars definitions 'labels)
       (let* (;; dummy LABELS functions, to be used as placeholders
@@ -967,7 +953,7 @@ unconditionally.
 Consequences are undefined if any result is not of the declared type
 -- typical symptoms including memory corruptions. Use with great
 care."
-  (the-in-policy value-type form '((type-check . 0)) start next result))
+  (the-in-policy value-type form **zero-typecheck-policy** start next result))
 
 #-sb-xc-host
 (setf (info :function :macro-function 'truly-the)
@@ -977,18 +963,24 @@ care."
 
 ;;;; SETQ
 
+(defun explode-setq (form err-fun)
+  (collect ((sets))
+    (do ((op (car form))
+         (thing (cdr form) (cddr thing)))
+        ((endp thing) (sets))
+      (if (endp (cdr thing))
+          (funcall err-fun "odd number of args to ~A: ~S" op form)
+          (sets `(,op ,(first thing) ,(second thing)))))))
+
 ;;; If there is a definition in LEXENV-VARS, just set that, otherwise
 ;;; look at the global information. If the name is for a constant,
 ;;; then error out.
 (def-ir1-translator setq ((&whole source &rest things) start next result)
-  (let ((len (length things)))
-    (when (oddp len)
-      (compiler-error "odd number of args to SETQ: ~S" source))
-    (if (= len 2)
-        (let* ((name (first things))
-               (value-form (second things))
-               (leaf (or (lexenv-find name vars) (find-free-var name))))
-          (etypecase leaf
+  (if (proper-list-of-length-p things 2)
+      (let* ((name (first things))
+             (value-form (second things))
+             (leaf (or (lexenv-find name vars) (find-free-var name))))
+        (etypecase leaf
             (leaf
              (when (constant-p leaf)
                (compiler-error "~S is a constant and thus can't be set." name))
@@ -1009,17 +1001,14 @@ care."
                  (setq-var start next result leaf value-form)))
             (cons
              (aver (eq (car leaf) 'macro))
-             ;; FIXME: [Free] type declaration. -- APD, 2002-01-26
-             (ir1-convert start next result
-                          `(setf ,(cdr leaf) ,(second things))))
+             ;; Allow *MACROEXPAND-HOOK* to see NAME get expanded,
+             ;; not just see a use of SETF on the new place.
+             (ir1-convert start next result `(setf ,name ,(second things))))
             (heap-alien-info
              (ir1-convert start next result
                           `(%set-heap-alien ',leaf ,(second things))))))
-        (collect ((sets))
-          (do ((thing things (cddr thing)))
-              ((endp thing)
-               (ir1-convert-progn-body start next result (sets)))
-            (sets `(setq ,(first thing) ,(second thing))))))))
+      (ir1-convert-progn-body start next result
+                              (explode-setq source 'compiler-error))))
 
 ;;; This is kind of like REFERENCE-LEAF, but we generate a SET node.
 ;;; This should only need to be called in SETQ.

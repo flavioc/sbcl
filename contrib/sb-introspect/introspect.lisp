@@ -39,6 +39,7 @@
            "DEFINITION-SOURCE"
            "DEFINITION-SOURCE-PATHNAME"
            "DEFINITION-SOURCE-FORM-PATH"
+           "DEFINITION-SOURCE-FORM-NUMBER"
            "DEFINITION-SOURCE-CHARACTER-OFFSET"
            "DEFINITION-SOURCE-FILE-WRITE-DATE"
            "DEFINITION-SOURCE-PLIST"
@@ -149,12 +150,19 @@ constant pool."
   ;; This may be incomplete depending on the debug level at which the
   ;; source was compiled.
   (form-path '() :type list)
+  ;; Depth first number of the form.
+  ;; FORM-PATH above usually contains just the top-level form number,
+  ;; ideally the proper form path could be dervied from the
+  ;; form-number and the tlf-number, but it's a bit complicated and
+  ;; Slime already knows how to deal with form numbers, so delegate
+  ;; that job to Slime.
+  (form-number nil :type (or null unsigned-byte))
   ;; Character offset of the top-level-form containing the definition.
   ;; This corresponds to the first element of form-path.
-  (character-offset nil :type (or null integer))
+  (character-offset nil :type (or null unsigned-byte))
   ;; File-write-date of the source file when compiled.
   ;; Null if not compiled from a file.
-  (file-write-date nil :type (or null integer))
+  (file-write-date nil :type (or null unsigned-byte))
   ;; plist from WITH-COMPILATION-UNIT
   (plist nil)
   ;; Any extra metadata that the caller might be interested in. For
@@ -169,8 +177,10 @@ constant pool."
             for source = (find-definition-source
                           (sb-c::vop-info-generator-function vop))
             do (setf (definition-source-description source)
-                     (list (sb-c::template-name vop)
-                           (sb-c::template-note vop)))
+                     (if (sb-c::template-note vop)
+                         (list (sb-c::template-name vop)
+                               (sb-c::template-note vop))
+                         (list (sb-c::template-name vop))))
             collect source))))
 
 (defun find-vop-source (name)
@@ -221,11 +231,7 @@ name. Type can currently be one of the following:
 
 If an unsupported TYPE is requested, the function will return NIL.
 "
-  (flet ((listify (x)
-           (if (listp x)
-               x
-               (list x)))
-         (get-class (name)
+  (flet ((get-class (name)
            (and (symbolp name)
                 (find-class name nil)))
          (real-fdefinition (name)
@@ -235,7 +241,7 @@ If an unsupported TYPE is requested, the function will return NIL.
              (if profile-info
                  (sb-profile::profile-info-encapsulated-fun profile-info)
                  (fdefinition name)))))
-    (listify
+    (sb-int:ensure-list
      (case type
        ((:variable)
         (when (and (symbolp name)
@@ -295,9 +301,10 @@ If an unsupported TYPE is requested, the function will return NIL.
         (let ((expander (or (sb-int:info :setf :inverse name)
                             (sb-int:info :setf :expander name))))
           (when expander
-            (find-definition-source (if (symbolp expander)
-                                        (symbol-function expander)
-                                        expander)))))
+            (find-definition-source
+             (cond ((symbolp expander) (symbol-function expander))
+                   ((listp expander) (cdr expander))
+                   (t expander))))))
        ((:structure)
         (let ((class (get-class name)))
           (if class
@@ -390,7 +397,10 @@ If an unsupported TYPE is requested, the function will return NIL.
           (loop for (kind loc) on locations by #'cddr
                 when loc
                 collect (let ((loc (translate-source-location loc)))
-                          (setf (definition-source-description loc) (list kind))
+                          (setf (definition-source-description loc)
+                                ;; Copy list to ensure that user code
+                                ;; cannot mutate the original.
+                                (copy-list (sb-int:ensure-list kind)))
                           loc))))
        (t
         nil)))))
@@ -410,7 +420,7 @@ If an unsupported TYPE is requested, the function will return NIL.
        (sb-pcl::method-combination-type-name object) :method-combination)))
     (package
      (translate-source-location (sb-impl::package-source-location object)))
-    (class
+    ((or class sb-mop:slot-definition)
      (translate-source-location (sb-pcl::definition-source object)))
     ;; Use the PCL definition location information instead of the function
     ;; debug-info for methods and generic functions. Sometimes the
@@ -455,20 +465,13 @@ If an unsupported TYPE is requested, the function will return NIL.
          (tlf (if debug-fun (sb-c::compiled-debug-fun-tlf-number debug-fun))))
     (make-definition-source
      :pathname
-     ;; KLUDGE: at the moment, we don't record the correct toplevel
-     ;; form number for forms processed by EVAL (including EVAL-WHEN
-     ;; :COMPILE-TOPLEVEL).  Until that's fixed, don't return a
-     ;; DEFINITION-SOURCE with a pathname.  (When that's fixed, take
-     ;; out the (not (debug-source-form ...)) test.
      (when (stringp (sb-c::debug-source-namestring debug-source))
        (parse-namestring (sb-c::debug-source-namestring debug-source)))
      :character-offset
      (if tlf
          (elt (sb-c::debug-source-start-positions debug-source) tlf))
-     ;; Unfortunately there is no proper source path available in the
-     ;; debug-source. FIXME: We could use sb-di:code-locations to get
-     ;; a full source path. -luke (12/Mar/2005)
      :form-path (if tlf (list tlf))
+     :form-number (sb-c::compiled-debug-fun-form-number debug-fun)
      :file-write-date (sb-c::debug-source-created debug-source)
      :plist (sb-c::debug-source-plist debug-source))))
 
@@ -483,6 +486,8 @@ If an unsupported TYPE is requested, the function will return NIL.
                          location)))
          (when number
            (list number)))
+       :form-number (sb-c:definition-source-location-form-number
+                     location)
        :plist (sb-c:definition-source-location-plist location))
       (make-definition-source)))
 
@@ -597,12 +602,19 @@ value."
 
 (defun get-simple-fun (functoid)
   (etypecase functoid
-    (sb-kernel::fdefn
-     (get-simple-fun (sb-vm::fdefn-fun functoid)))
-    ((or null sb-impl::funcallable-instance)
+    (sb-kernel:fdefn
+     (get-simple-fun (sb-kernel:fdefn-fun functoid)))
+    ((or null sb-kernel:funcallable-instance)
      nil)
+    (sb-kernel:closure
+     (let ((fun (sb-kernel:%closure-fun functoid)))
+       (if (and (eq (sb-kernel:%fun-name fun) 'sb-impl::encapsulation)
+                (plusp (sb-kernel:get-closure-length functoid))
+                (typep (sb-kernel:%closure-index-ref functoid 0) 'sb-impl::encapsulation-info))
+           (sb-impl::encapsulation-info-definition (sb-kernel:%closure-index-ref functoid 0))
+           fun)))
     (function
-     (sb-kernel::%fun-fun functoid))))
+     (sb-kernel:%fun-fun functoid))))
 
 ;; Call FUNCTION with two args, NAME and VALUE, for each value that is
 ;; either the FDEFINITION or MACRO-FUNCTION of some global name.

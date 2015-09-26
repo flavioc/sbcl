@@ -90,12 +90,22 @@
 
 ;;; ARRAY-IN-BOUNDS-P should work when given non-INDEXes as its
 ;;; subscripts (and return NIL, of course)
-(let ((a (make-array 10 :fill-pointer 5)))
-  (assert (not (array-in-bounds-p a -1)))
-  (assert (array-in-bounds-p a 3))
-  (assert (array-in-bounds-p a 7))
-  (assert (not (array-in-bounds-p a 11)))
-  (assert (not (array-in-bounds-p a (1+ most-positive-fixnum)))))
+(with-test (:name array-in-bounds-p)
+  (macrolet
+      ((test-case (array subscript expected)
+         `(progn
+            (assert (,(if expected 'progn 'not)
+                      (array-in-bounds-p ,array ,subscript)))
+            (assert (,(if expected 'progn 'not)
+                      (funcall (compile nil '(lambda (array subscript)
+                                              (array-in-bounds-p array subscript)))
+                               ,array ,subscript))))))
+   (let ((a (make-array 10 :fill-pointer 5)))
+     (test-case a -1                        nil)
+     (test-case a  3                        t)
+     (test-case a  7                        t)
+     (test-case a 11                        nil)
+     (test-case a (1+ most-positive-fixnum) nil))))
 
 ;;; arrays of bits should work:
 (let ((a (make-array '(10 10) :element-type 'bit :adjustable t)))
@@ -119,16 +129,19 @@
 
 (multiple-value-bind (fun warn fail)
     (compile nil '(lambda () (aref (make-array 0) 0)))
+  (declare (ignore warn fail))
   #+nil (assert fail) ; doesn't work, (maybe because ASSERTED-TYPE is NIL?)
   (assert-error (funcall fun) type-error))
 
 (multiple-value-bind (fun warn fail)
     (compile nil '(lambda () (aref (make-array 1) 1)))
+  (declare (ignore warn))
   (assert fail)
   (assert-error (funcall fun) type-error))
 
 (multiple-value-bind (fun warn fail)
     (compile nil '(lambda () (make-array 5 :element-type 'undefined-type)))
+  (declare (ignore fun fail))
   (assert warn))
 
 (flet ((opaque-identity (x) x))
@@ -297,6 +310,7 @@
      (style-warning ()
        t)
      (:no-error (&rest args)
+       (declare (ignore args))
        nil))))
 
 (with-test (:name :dont-make-array-bad-keywords)

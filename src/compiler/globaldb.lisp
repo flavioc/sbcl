@@ -34,6 +34,12 @@
 
 (in-package "SB!C")
 
+#-no-ansi-print-object
+(defmethod print-object ((x meta-info) stream)
+  (print-unreadable-object (x stream)
+    (format stream "~S ~S, ~D" (meta-info-category x) (meta-info-kind x)
+            (meta-info-number x))))
+
 (!begin-collecting-cold-init-forms)
 #!+sb-show (!cold-init-forms (/show0 "early in globaldb.lisp cold init"))
 
@@ -96,76 +102,6 @@
 ;;; version with our version would be unlikely to help, because that
 ;;; would make the cross-compiler very confused.)
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-
-(def!struct (meta-info
-            #-no-ansi-print-object
-            (:print-object (lambda (x s)
-                             (print-unreadable-object (x s)
-                               (format s
-                                       "~S ~S, Number = ~W"
-                                       (meta-info-category x)
-                                       (meta-info-kind x)
-                                       (meta-info-number x)))))
-            (:constructor
-             !make-meta-info (number category kind type-spec
-                              type-checker validate-function default))
-            (:copier nil))
-  ;; a number that uniquely identifies this object
-  (number nil :type info-number :read-only t)
-  ;; 2-part key to this piece of metainfo
-  (category nil :type keyword :read-only t)
-  (kind nil :type keyword :read-only t)
-  ;; a type specifier which info of this type must satisfy
-  (type-spec nil :type t :read-only t)
-  ;; Two functions called by (SETF INFO) before calling SET-INFO-VALUE.
-  ;; 1. A function that type-checks its argument and returns it,
-  ;;    or signals an error.
-  ;;    Some Lisps trip over their shoelaces trying to assert that
-  ;;    a function is (function (t) t). Our code is fine though.
-  (type-checker nil :type #+sb-xc-host function #-sb-xc-host (sfunction (t) t)
-                :read-only t)
-  ;; 2. a function of two arguments, a name and new-value, which performs
-  ;;    any other checks and/or side-effects including signaling an error.
-  (validate-function nil :type (or function null) :read-only t)
-  ;; If FUNCTIONP, then a function called when there is no information of
-  ;; this type. If not FUNCTIONP, then any object serving as a default.
-  (default nil)) ; shoud be :read-only t.  I have a fix for that.
-
-(declaim (freeze-type meta-info))
-
-(defconstant +info-metainfo-type-num+ 0)
-
-;; Perform the equivalent of (GET-INFO-VALUE sym +INFO-METAINFO-TYPE-NUM+)
-;; but without the AVER that meta-info for +info-metainfo-type-num+ exists,
-;; and bypassing the defaulting logic, returning zero or more META-INFOs that
-;; match KIND based on half of their key, which is often a unique
-;; identifier by itself.
-(defmacro !get-meta-infos (kind)
-  `(let* ((info-vector (symbol-info-vector ,kind))
-          (index (if info-vector
-                     (packed-info-value-index info-vector +no-auxilliary-key+
-                                              +info-metainfo-type-num+))))
-     (if index (svref info-vector index))))
-
-(defun meta-info (category kind &optional (errorp t))
-  ;; Really this takes (KEYWORD KEYWORD) but SYMBOL is easier to test.
-  ;; Nearly all callers have ERRORP defaulting to T,
-  ;; so there is an explicit check anyway if not found.
-  (declare (symbol category kind))
-  ;; Usually KIND designates a unique object, so we store only that object.
-  ;; Otherwise we store a list which has a small (<= 4) handful of items.
-  (or (let ((metadata (!get-meta-infos kind)))
-        (cond ((listp metadata)
-               (dolist (info metadata nil) ; FIND is slower :-(
-                 (when (eq (meta-info-category (truly-the meta-info info))
-                           category)
-                   (return info))))
-              ((eq (meta-info-category (truly-the meta-info metadata)) category)
-               metadata)))
-      (if errorp
-          (error "(~S ~S) is not a defined info type." category kind)
-          nil)))
-
 (defun !register-meta-info (metainfo)
   (let* ((name (meta-info-kind metainfo))
          (list (!get-meta-infos name)))
@@ -190,7 +126,7 @@
 ) ; EVAL-WHEN
 
 #-sb-xc
-(setf (get '!%define-info-type :sb-cold-funcall-handler)
+(setf (get '!%define-info-type :sb-cold-funcall-handler/for-effect)
       (lambda (category kind type-spec checker validator default id)
         ;; The SB!FASL: symbols are poor style, but the lesser evil.
         ;; If exported, then they'll stick around in the target image.
@@ -202,7 +138,7 @@
            id
            (sb!fasl::write-slots
             (sb!fasl::allocate-struct sb!fasl::*dynamic* layout)
-            (find-layout 'meta-info)
+            'meta-info ; give the type name in lieu of layout
             :category category :kind kind :type-spec type-spec
             :type-checker checker :validate-function validator
             :default default :number id)))))
@@ -246,8 +182,23 @@
   ;; fasls. That's not true now, probably never was. A compiler is permitted to
   ;; coalesce EQUAL quoted lists and there's no defense against it, so why try?
   (let ((form
-         `(!%define-info-type ,category ,kind ',type-spec
-           ,(if (eq type-spec 't) '#'identity `(lambda (x) (the ,type-spec x)))
+         `(!%define-info-type
+           ,category ,kind ',type-spec
+           ,(cond ((eq type-spec 't) '#'identity)
+                  ;; evil KLUDGE to avoid "undefined type" warnings
+                  ;; when building the cross-compiler.
+                  #+sb-xc-host
+                  ((member type-spec
+                           '((or fdefn null)
+                             (or alien-type null) (or heap-alien-info null))
+                           :test 'equal)
+                   `(lambda (x)
+                      (declare (notinline typep))
+                      (if (typep x ',type-spec)
+                          x
+                          (error "~S is not a ~S" x ',type-spec))))
+                  (t
+                   `(named-lambda "check-type" (x) (the ,type-spec x))))
            ,validate-function ,default
            ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
            ,(or (and (eq category :function) (eq kind :definition)
@@ -324,44 +275,45 @@
 
 ;;;; GET-INFO-VALUE
 
+;;; If non-nil, *GLOBALDB-OBSERVER*'s CAR is a bitmask over info numbers
+;;; for which you'd like to call the function in the CDR whenever info
+;;; of that number is queried.
+(!defvar *globaldb-observer* nil)
+(declaim (type (or (cons (unsigned-byte #.(ash 1 info-number-bits)) function)
+                   null) *globaldb-observer*))
+#-sb-xc-host (declaim (always-bound *globaldb-observer*))
+
 ;;; Return the value of NAME / INFO-NUMBER from the global environment,
 ;;; or return the default if there is no global info.
 ;;; The secondary value indicates whether info was found vs defaulted.
 (declaim (ftype (sfunction (t info-number) (values t boolean))
                 get-info-value))
 (defun get-info-value (name info-number)
-  (multiple-value-bind (vector aux-key)
-      (let ((name (uncross name)))
-        (with-globaldb-name (key1 key2) name
-          :simple (values (symbol-info-vector key1) key2)
-          :hairy (values (info-gethash name *info-environment*)
-                         +no-auxilliary-key+)))
-    (when vector
-      (let ((index
-             (packed-info-value-index vector aux-key info-number)))
-        (when index
-          (return-from get-info-value (values (svref vector index) t))))))
-  (let ((val (meta-info-default (aref *info-types* info-number))))
-    (values (if (functionp val) (funcall val name) val) nil)))
-
-;; Perform the approximate equivalent operations of retrieving
-;; (INFO :CATEGORY :KIND NAME), but if no info is found, invoke CREATION-FORM
-;; to produce an object that becomes the value for that piece of info, storing
-;; and returning it. The entire sequence behaves atomically but with a proviso:
-;; the creation form's result may be discarded, and another object returned
-;; instead (presumably) from another thread's execution of the creation form.
-;; If constructing the object has either non-trivial cost, or deleterious
-;; side-effects from making and discarding its result, do NOT use this macro.
-;; A mutex-guarded table would probably be more appropriate in such cases.
-;;
-(def!macro get-info-value-initializing (category kind name creation-form)
-  (with-unique-names (info-number proc)
-    `(let ((,info-number
-            ,(if (and (keywordp category) (keywordp kind))
-                 (meta-info-number (meta-info category kind))
-                 `(meta-info-number (meta-info ,category ,kind)))))
-       (dx-flet ((,proc () ,creation-form))
-         (%get-info-value-initializing ,name ,info-number #',proc)))))
+  (let* ((hook *globaldb-observer*)
+         (hookp (and (and hook
+                          (not (eql 0 (car hook)))
+                          (logbitp info-number (car hook))))))
+    (multiple-value-bind (vector aux-key)
+        (let ((name (uncross name)))
+          (with-globaldb-name (key1 key2) name
+           ;; In the :simple branch, KEY1 is no doubt a symbol,
+           ;; but constraint propagation isn't informing the compiler here.
+           :simple (values (symbol-info-vector (truly-the symbol key1)) key2)
+           :hairy (values (info-gethash name *info-environment*)
+                          +no-auxilliary-key+)))
+      (when vector
+        (let ((index (packed-info-value-index vector aux-key info-number)))
+          (when index
+            (let ((answer (svref vector index)))
+              (when hookp
+                (funcall (truly-the function (cdr hook))
+                         name info-number answer t))
+              (return-from get-info-value (values answer t)))))))
+    (let* ((def (meta-info-default (aref *info-types* info-number)))
+           (answer (if (functionp def) (funcall def name) def)))
+      (when hookp
+        (funcall (truly-the function (cdr hook)) name info-number answer nil))
+      (values answer nil))))
 
 ;; interface to %ATOMIC-SET-INFO-VALUE
 ;; GET-INFO-VALUE-INITIALIZING is a restricted case of this,
@@ -420,6 +372,12 @@
   :default
   #+sb-xc-host nil
   #-sb-xc-host (lambda (name) (if (fboundp name) :function nil)))
+
+;;; Indicates whether the function is deprecated.
+(define-info-type (:function :deprecated) :type-spec deprecation-info)
+
+(declaim (ftype (sfunction (t) ctype)
+                specifier-type ctype-of sb!kernel::ctype-of-array))
 
 ;;; The type specifier for this function.
 (define-info-type (:function :type)
@@ -505,6 +463,14 @@
 ;;; structure containing the info used to special-case compilation.
 (define-info-type (:function :info) :type-spec (or fun-info null))
 
+;;; This is a type specifier <t> such that if an argument X to the function
+;;; does not satisfy (TYPEP x <t>) then the function definitely returns NIL.
+;;; When the named function is a predicate that appears in (SATISFIES p)
+;;; specifiers, it is possible for type operations to see into the predicate
+;;; just enough to determine that something like
+;;;   (AND (SATISFIES UNINTERESTING-METHOD-REDEFINITION-P) RATIONAL)
+;;; is *empty-type*, which in turn avoids type cache pollution.
+(define-info-type (:function :predicate-truth-constraint) :type-spec t)
 
 ;;;; ":VARIABLE" subsection - Data pertaining to globally known variables.
 
@@ -519,7 +485,7 @@
 (define-info-type (:variable :always-bound)
   :type-spec (member nil :eventually :always-bound))
 
-(define-info-type (:variable :deprecated) :type-spec t)
+(define-info-type (:variable :deprecated) :type-spec deprecation-info)
 
 ;;; the declared type for this variable
 (define-info-type (:variable :type)
@@ -645,6 +611,27 @@
 ;;; The classoid-cell for this type
 (define-info-type (:type :classoid-cell) :type-spec t)
 
+(defun find-classoid-cell (name &key create)
+  (let ((real-name (uncross name)))
+    (cond ((info :type :classoid-cell real-name))
+          (create
+           (get-info-value-initializing
+            :type :classoid-cell real-name
+            (sb!kernel::make-classoid-cell real-name))))))
+
+;;; Return the classoid with the specified NAME. If ERRORP is false,
+;;; then NIL is returned when no such class exists.
+(defun find-classoid (name &optional (errorp t))
+  (declare (type symbol name))
+  (let ((cell (find-classoid-cell name)))
+    (cond ((and cell (classoid-cell-classoid cell)))
+          (errorp
+           (error 'simple-type-error
+                  :datum nil
+                  :expected-type 'class
+                  :format-control "Class not yet defined: ~S"
+                  :format-arguments (list name))))))
+
 ;;; layout for this type being used by the compiler
 (define-info-type (:type :compiler-layout)
   :type-spec (or layout null)
@@ -657,6 +644,9 @@
 (define-info-type (:type :lambda-list) :type-spec t)
 
 (define-info-type (:type :source-location) :type-spec t)
+
+;;; Indicates whether the function is deprecated.
+(define-info-type (:type :deprecated) :type-spec deprecation-info)
 
 ;;;; ":TYPED-STRUCTURE" subsection.
 ;;;; Data pertaining to structures that used DEFSTRUCT's :TYPE option.
@@ -700,7 +690,8 @@
 ;;;; ":SETF" subsection - Data pertaining to expansion of the omnipotent macro.
 (define-info-type (:setf :inverse) :type-spec (or symbol null))
 (define-info-type (:setf :documentation) :type-spec (or string null))
-(define-info-type (:setf :expander) :type-spec (or function null))
+(define-info-type (:setf :expander)
+    :type-spec (or function (cons integer function) null))
 
 ;;;; ":CAS" subsection - Like SETF but there are no "inverses", just expanders
 (define-info-type (:cas :expander) :type-spec (or function null))

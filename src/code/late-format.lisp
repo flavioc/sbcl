@@ -8,48 +8,7 @@
 ;;;; files for more information.
 
 (in-package "SB!FORMAT")
-
-(define-condition format-error (error reference-condition)
-  ((complaint :reader format-error-complaint :initarg :complaint)
-   (args :reader format-error-args :initarg :args :initform nil)
-   (control-string :reader format-error-control-string
-                   :initarg :control-string
-                   :initform *default-format-error-control-string*)
-   (offset :reader format-error-offset :initarg :offset
-           :initform *default-format-error-offset*)
-   (second-relative :reader format-error-second-relative
-                    :initarg :second-relative :initform nil)
-   (print-banner :reader format-error-print-banner :initarg :print-banner
-                 :initform t))
-  (:report %print-format-error)
-  (:default-initargs :references nil))
 
-(defun %print-format-error (condition stream)
-  (format stream
-          "~:[~*~;error in ~S: ~]~?~@[~%  ~A~%  ~V@T^~@[~V@T^~]~]"
-          (format-error-print-banner condition)
-          'format
-          (format-error-complaint condition)
-          (format-error-args condition)
-          (format-error-control-string condition)
-          (format-error-offset condition)
-          (format-error-second-relative condition)))
-
-(def!struct format-directive
-  (string (missing-arg) :type simple-string)
-  (start (missing-arg) :type (and unsigned-byte fixnum))
-  (end (missing-arg) :type (and unsigned-byte fixnum))
-  (character (missing-arg) :type character)
-  (colonp nil :type (member t nil))
-  (atsignp nil :type (member t nil))
-  (params nil :type list))
-(def!method print-object ((x format-directive) stream)
-  (print-unreadable-object (x stream)
-    (write-string (format-directive-string x)
-                  stream
-                  :start (format-directive-start x)
-                  :end (format-directive-end x))))
-
 ;;;; TOKENIZE-CONTROL-STRING
 
 (defun tokenize-control-string (string)
@@ -1446,3 +1405,70 @@
         (catch 'give-up-format-string-walk
           (let ((directives (tokenize-control-string string)))
             (walk-directive-list directives args)))))))
+
+;;; Optimize common case of constant keyword arguments
+;;; to WRITE and WRITE-TO-STRING
+(flet
+    ((expand (fn object keys)
+      (do (streamvar bind ignore)
+          ((or (atom keys) (atom (cdr keys)))
+           (if keys ; fail
+               (values nil t)
+               (values
+                (let* ((objvar (copy-symbol 'object))
+                       (bind `((,objvar ,object) ,@(nreverse bind)))
+                       (ignore (when ignore `((declare (ignore ,@ignore))))))
+                  (case fn
+                   (write
+                    ;; When :STREAM was specified, this used to insert a call
+                    ;; to (OUT-SYNONYM-OF STREAMVAR) which added junk to the
+                    ;; expansion which was not likely to improve performance.
+                    ;; The benefit of this transform is that it avoids runtime
+                    ;; keyword parsing and binding of 16 specials vars, *not*
+                    ;; that it can inline testing for T or NIL as the stream.
+                    `(let ,bind ,@ignore
+                       ,@(if streamvar
+                            `((%write ,objvar ,streamvar))
+                            `((output-object ,objvar *standard-output*)
+                              ,objvar))))
+                   (write-to-string
+                    (if (cdr bind)
+                        `(let ,bind ,@ignore (stringify-object ,objvar))
+                        `(stringify-object ,object)))))
+                nil)))
+        (let* ((key (pop keys))
+               (value (pop keys))
+               (variable
+                (cond ((getf '(:array *print-array*
+                               :base *print-base*
+                               :case *print-case*
+                               :circle *print-circle*
+                               :escape *print-escape*
+                               :gensym *print-gensym*
+                               :length *print-length*
+                               :level *print-level*
+                               :lines *print-lines*
+                               :miser-width *print-miser-width*
+                               :pprint-dispatch *print-pprint-dispatch*
+                               :pretty *print-pretty*
+                               :radix *print-radix*
+                               :readably *print-readably*
+                               :right-margin *print-right-margin*
+                               :suppress-errors *suppress-print-errors*)
+                             key))
+                      ((and (eq key :stream) (eq fn 'write))
+                       (or streamvar (setq streamvar (copy-symbol 'stream))))
+                      (t
+                       (return (values nil t))))))
+          (when (assoc variable bind)
+            ;; First key has precedence, but we still need to execute the
+            ;; argument, and in the right order.
+            (setf variable (gensym "IGNORE"))
+            (push variable ignore))
+          (push (list variable value) bind)))))
+
+  (sb!c:define-source-transform write (object &rest keys)
+    (expand 'write object keys))
+
+  (sb!c:define-source-transform write-to-string (object &rest keys)
+    (expand 'write-to-string object keys)))

@@ -88,19 +88,18 @@
                   (slot-accessor-std-p slotd type))))))
 
 (defun slot-missing-info (class slot-name)
-  (flet ((missing (operation)
-           (lambda (object)
-             (slot-missing class object slot-name operation))))
-    (make-slot-info
-     :reader (missing 'slot-value)
-     :boundp (missing 'slot-boundp)
-     :writer (lambda (new-value object)
-               (slot-missing class object slot-name 'setf new-value)))))
+  (make-slot-info
+   :reader (lambda (object)
+             (values (slot-missing class object slot-name 'slot-value)))
+   :boundp (lambda (object)
+             (and (slot-missing class object slot-name 'slot-boundp) t))
+   :writer (lambda (new-value object)
+             (slot-missing class object slot-name 'setf new-value)
+             new-value)))
 
 (defun compute-pv (slot-name-lists wrappers)
-  (unless (listp wrappers)
-    (setq wrappers (list wrappers)))
-  (let (elements)
+  (let ((wrappers (ensure-list wrappers))
+        elements)
     (dolist (slot-names slot-name-lists)
       (when slot-names
         (let* ((wrapper (pop wrappers))
@@ -108,18 +107,18 @@
                (class (wrapper-class* wrapper)))
           (dolist (slot-name (cdr slot-names))
             (let ((cell
-                   (or (find-slot-cell wrapper slot-name)
-                       (cons nil (slot-missing-info class slot-name)))))
+                    (or (find-slot-cell wrapper slot-name)
+                        (cons nil (slot-missing-info class slot-name)))))
               (push (when (and std-p (use-standard-slot-access-p class slot-name 'all))
                       (car cell))
-                  elements)
+                    elements)
               (push (or (cdr cell)
                         (bug "No SLOT-INFO for ~S in ~S" slot-name class))
-                  elements))))))
+                    elements))))))
     (let* ((n (length elements))
            (pv (make-array n)))
       (loop for i from (1- n) downto 0
-         do (setf (svref pv i) (pop elements)))
+            do (setf (svref pv i) (pop elements)))
       pv)))
 
 (defun pv-table-lookup (pv-table pv-wrappers)

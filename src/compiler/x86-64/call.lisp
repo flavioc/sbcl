@@ -41,6 +41,9 @@
   (make-wired-tn (primitive-type-or-lose 'system-area-pointer)
                  sap-stack-sc-number return-pc-save-offset))
 
+(defconstant return-pc-passing-offset
+  (make-sc-offset sap-stack-sc-number return-pc-save-offset))
+
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in.
 ;;;
@@ -52,6 +55,9 @@
   (declare (ignore standard))
   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
                  ocfp-save-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc-offset control-stack-sc-number ocfp-save-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -1374,7 +1380,8 @@
                     `((:policy :fast-safe)
                       (:translate ,translate)))
                 (:args ,@(mapcar (lambda (arg)
-                                   `(,arg :scs (any-reg descriptor-reg)))
+                                   `(,arg :scs (any-reg descriptor-reg
+                                                control-stack constant)))
                                  args))
                 (:vop-var vop)
                 (:save-p :compute-only)
@@ -1440,14 +1447,14 @@
   (inst cmp (make-ea :qword
                      :base thread-base-tn
                      :disp (* thread-stepping-slot n-word-bytes))
-        nil-value)
+        0)
   #!-sb-thread
   (inst cmp (make-ea :qword
                      :disp (+ nil-value (static-symbol-offset
                                          'sb!impl::*stepping*)
                               (* symbol-value-slot n-word-bytes)
                               (- other-pointer-lowtag)))
-        nil-value))
+        0))
 
 (define-vop (step-instrument-before-vop)
   (:policy :fast-safe)

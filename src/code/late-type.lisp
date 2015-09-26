@@ -28,7 +28,16 @@
 ;;; This condition is signalled whenever we make a UNKNOWN-TYPE so that
 ;;; compiler warnings can be emitted as appropriate.
 (define-condition parse-unknown-type (condition)
-  ((specifier :reader parse-unknown-type-specifier :initarg :specifier)))
+  ((specifier :reader parse-unknown-type-specifier :initarg :specifier))
+  (:default-initargs
+   :specifier (missing-arg)))
+
+;;; This condition is signalled whenever we encounter a type (DEFTYPE,
+;;; structure, condition, class) that has been marked as deprecated.
+(define-condition parse-deprecated-type (condition)
+  ((specifier :reader parse-deprecated-type-specifier :initarg :specifier))
+  (:default-initargs
+   :specifier (missing-arg)))
 
 ;;; These functions are used as method for types which need a complex
 ;;; subtypep method to handle some superclasses, but cover a subtree
@@ -128,14 +137,6 @@
 ;;;;    parsing it.
 ;;;; -- Many of the places that can be annotated with real types can
 ;;;;    also be annotated with function or values types.
-
-;;; the description of a &KEY argument
-(defstruct (key-info #-sb-xc-host (:pure t)
-                     (:copier nil))
-  ;; the key (not necessarily a keyword in ANSI Common Lisp)
-  (name (missing-arg) :type symbol :read-only t)
-  ;; the type of the argument value
-  (type (missing-arg) :type ctype :read-only t))
 
 (!define-type-method (values :simple-subtypep :complex-subtypep-arg1)
                      (type1 type2)
@@ -334,8 +335,8 @@
 (!define-type-method (constant :simple-=) (type1 type2)
   (type= (constant-type-type type1) (constant-type-type type2)))
 
-(!def-type-translator constant-arg (type)
-  (make-constant-type :type (single-value-specifier-type type)))
+(!def-type-translator constant-arg ((:context context) type)
+  (make-constant-type :type (single-value-specifier-type-r context type)))
 
 ;;; Return the lambda-list-like type specification corresponding
 ;;; to an ARGS-TYPE.
@@ -366,45 +367,38 @@
 
     (result)))
 
-(!def-type-translator function (&optional (args '*) (result '*))
-  (let ((result (coerce-to-values (values-specifier-type result))))
+(!def-type-translator function ((:context context)
+                                &optional (args '*) (result '*))
+  (let ((result (coerce-to-values (values-specifier-type-r context result))))
     (if (eq args '*)
         (if (eq result *wild-type*)
             (specifier-type 'function)
             (make-fun-type :wild-args t :returns result))
-        (multiple-value-bind (required optional rest keyp keywords allowp)
-            (parse-args-types args)
+        (multiple-value-bind (llks required optional rest keywords)
+            (parse-args-types context args :function-type)
           (if (and (null required)
                    (null optional)
                    (eq rest *universal-type*)
-                   (not keyp))
+                   (not (ll-kwds-keyp llks)))
               (if (eq result *wild-type*)
                   (specifier-type 'function)
                   (make-fun-type :wild-args t :returns result))
               (make-fun-type :required required
                              :optional optional
                              :rest rest
-                             :keyp keyp
+                             :keyp (ll-kwds-keyp llks)
                              :keywords keywords
-                             :allowp allowp
+                             :allowp (ll-kwds-allowp llks)
                              :returns result))))))
 
-(!def-type-translator values (&rest values)
+(!def-type-translator values :list ((:context context) &rest values)
   (if (eq values '*)
       *wild-type*
-      (multiple-value-bind (required optional rest keyp keywords allowp llk-p)
-          (parse-args-types values)
-        (declare (ignore keywords))
-        (cond (keyp
-               (error "&KEY appeared in a VALUES type specifier ~S."
-                      `(values ,@values)))
-              (llk-p
-               (make-values-type :required required
-                                 :optional optional
-                                 :rest rest
-                                 :allowp allowp))
-              (t
-               (make-short-values-type required))))))
+      (multiple-value-bind (llks required optional rest)
+          (parse-args-types context values :values-type)
+        (if (plusp llks)
+            (make-values-type :required required :optional optional :rest rest)
+            (make-short-values-type required)))))
 
 ;;;; VALUES types interfaces
 ;;;;
@@ -812,7 +806,7 @@
   If values are T and T, type1 definitely is a subtype of type2.
   If values are NIL and T, type1 definitely is not a subtype of type2.
   If values are NIL and NIL, it couldn't be determined."
-  (declare (ignore environment))
+  (declare (type lexenv-designator environment) (ignore environment))
   (csubtypep (specifier-type type1) (specifier-type type2)))
 
 ;;; If two types are definitely equivalent, return true. The second
@@ -995,6 +989,18 @@
   (declare (type ctype type))
   (funcall (type-class-unparse (type-class-info type)) type))
 
+;;; Don't try to define a print method until it's actually gonna work!
+;;; (Otherwise this would be near the DEFSTRUCT)
+(def!method print-object ((ctype ctype) stream)
+  (print-unreadable-object (ctype stream :type t)
+    (prin1 (type-specifier ctype) stream)))
+
+;;; Same here.
+;;; Just dump it as a specifier. (We'll convert it back upon loading.)
+(defun make-type-load-form (type)
+  (declare (type ctype type))
+  `(specifier-type ',(type-specifier type)))
+
 (defun-cached (type-negation :hash-function #'type-hash-value
                              :hash-bits 8
                              :values 1)
@@ -1017,10 +1023,23 @@
 
 ;;; Take a list of type specifiers, computing the translation of each
 ;;; specifier and defining it as a builtin type.
+;;; Seee the comments in 'type-init' for why this is a slightly
+;;; screwy way to go about it.
 (declaim (ftype (function (list) (values)) !precompute-types))
 (defun !precompute-types (specs)
   (dolist (spec specs)
-    (let ((res (specifier-type spec)))
+    (let ((res (handler-bind
+                   ((parse-unknown-type
+                     (lambda (c)
+                       (declare (ignore c))
+                       ;; We can handle conditions at this point,
+                       ;; but win32 can not perform i/o here because
+                       ;; !MAKE-COLD-STDERR-STREAM has no implementation.
+                       #!-win32
+                       (progn (write-string "//caught: parse-unknown ")
+                              (write spec)
+                              (terpri)))))
+             (specifier-type spec))))
       (unless (unknown-type-p res)
         (setf (info :type :builtin spec) res)
         (setf (info :type :kind spec) :primitive))))
@@ -1194,6 +1213,23 @@
              (type= cdr-type *empty-type*)
            (aver (not yes))
            (not surep))))))
+
+(defun cons-type-length-info (type)
+  (declare (type cons-type type))
+  (do ((min 1 (1+ min))
+       (cdr (cons-type-cdr-type type) (cons-type-cdr-type cdr)))
+      ((not (cons-type-p cdr))
+       (cond
+         ((csubtypep cdr (specifier-type 'null))
+          (values min t))
+         ((csubtypep *universal-type* cdr)
+          (values min nil))
+         ((type/= (type-intersection (specifier-type 'cons) cdr) *empty-type*)
+          (values min nil))
+         ((type/= (type-intersection (specifier-type 'null) cdr) *empty-type*)
+          (values min t))
+         (t (values min :maybe))))
+    ()))
 
 (!define-type-method (named :complex-=) (type1 type2)
   (cond
@@ -1461,7 +1497,7 @@
 
 (!define-type-method (hairy :simple-intersection2 :complex-intersection2)
                      (type1 type2)
-  (cond ((type= type1 type2)
+ (acond ((type= type1 type2)
          type1)
         ((eq type2 *satisfies-keywordp-type*)
          ;; (AND (MEMBER A) (SATISFIES KEYWORDP)) is possibly non-empty
@@ -1472,20 +1508,21 @@
              *empty-type*
              (multiple-value-bind (answer certain)
                  (types-equal-or-intersect type1 (specifier-type 'symbol))
-               (if (and (not answer) certain)
-                   *empty-type*
-                   nil))))
+               (and (not answer) certain *empty-type*))))
         ((eq type2 *fun-name-type*)
          (multiple-value-bind (answer certain)
              (types-equal-or-intersect type1 (specifier-type 'symbol))
-           (if (and (not answer) certain)
-               (multiple-value-bind (answer certain)
-                   (types-equal-or-intersect type1 (specifier-type 'cons))
-                 (if (and (not answer) certain)
-                     *empty-type*
-                     nil))
-               nil)))
-        (t nil)))
+           (and (not answer)
+                certain
+                (multiple-value-bind (answer certain)
+                    (types-equal-or-intersect type1 (specifier-type 'cons))
+                  (and (not answer) certain *empty-type*)))))
+        ((and (typep (hairy-type-specifier type2) '(cons (eql satisfies)))
+              (info :function :predicate-truth-constraint
+                    (cadr (hairy-type-specifier type2))))
+         (multiple-value-bind (answer certain)
+             (types-equal-or-intersect type1 (specifier-type it))
+           (and (not answer) certain *empty-type*)))))
 
 (!define-type-method (hairy :simple-union2)
                      (type1 type2)
@@ -1499,22 +1536,17 @@
       (values t t)
       (values nil nil)))
 
-(!def-type-translator satisfies (&whole whole fun)
-  (declare (ignore fun))
-  ;; Check legality of arguments.
-  (destructuring-bind (satisfies predicate-name) whole
-    (declare (ignore satisfies))
-    (unless (symbolp predicate-name)
-      (error 'simple-type-error
-             :datum predicate-name
-             :expected-type 'symbol
-             :format-control "The SATISFIES predicate name is not a symbol: ~S"
-             :format-arguments (list predicate-name)))
-    ;; Create object.
-    (case predicate-name
-      (keywordp *satisfies-keywordp-type*)
-      (legal-fun-name-p *fun-name-type*)
-      (t (%make-hairy-type whole)))))
+(!def-type-translator satisfies :list (&whole whole predicate-name)
+  (unless (symbolp predicate-name)
+    (error 'simple-type-error
+           :datum predicate-name
+           :expected-type 'symbol
+           :format-control "The SATISFIES predicate name is not a symbol: ~S"
+           :format-arguments (list predicate-name)))
+  (case predicate-name
+   (keywordp *satisfies-keywordp-type*)
+   (legal-fun-name-p *fun-name-type*)
+   (t (%make-hairy-type whole))))
 
 ;;;; negation types
 
@@ -1654,7 +1686,7 @@
          (nseltype (array-type-specialized-element-type ntype))
          (neltype (array-type-element-type ntype)))
     (if (and (eql ndims '*) (null ncomplexp)
-             (eql neltype *wild-type*) (eql nseltype *wild-type*))
+             (eq neltype *wild-type*) (eq nseltype *wild-type*))
         (make-array-type (array-type-dimensions type1)
                          :complexp t
                          :element-type (array-type-element-type type1)
@@ -1689,8 +1721,8 @@
 (!define-type-method (negation :simple-=) (type1 type2)
   (type= (negation-type-type type1) (negation-type-type type2)))
 
-(!def-type-translator not (typespec)
-  (type-negation (specifier-type typespec)))
+(!def-type-translator not :list ((:context context) typespec)
+  (type-negation (specifier-type-r context typespec)))
 
 ;;;; numeric types
 
@@ -2031,7 +2063,7 @@
   (setf (info :type :builtin 'number)
         (make-numeric-type :complexp nil)))
 
-(!def-type-translator complex (&optional (typespec '*))
+(!def-type-translator complex ((:context context) &optional (typespec '*))
   (if (eq typespec '*)
       (specifier-type '(complex real))
       (labels ((not-numeric ()
@@ -2094,7 +2126,7 @@
                           (bug "~@<(known bug #145): The type ~S is too hairy to be ~
 used for a COMPLEX component.~:@>"
                                typespec)))))))
-        (let ((ctype (specifier-type typespec)))
+        (let ((ctype (specifier-type-r context typespec)))
           (do-complex ctype)))))
 
 ;;; If X is *, return NIL, otherwise return the bound, which must be a
@@ -2846,8 +2878,7 @@ used for a COMPLEX component.~:@>"
         (apply #'type-intersection
                (if (xset-empty-p xset)
                    *universal-type*
-                   (make-negation-type
-                    :type (make-member-type :xset xset)))
+                   (make-negation-type :type (make-member-type xset nil)))
                (mapcar
                 (lambda (x)
                   (let* ((opposite (neg-fp-zero x))
@@ -2856,7 +2887,7 @@ used for a COMPLEX component.~:@>"
                      (make-negation-type
                       :type (modified-numeric-type type :low nil :high nil))
                      (modified-numeric-type type :low nil :high (list opposite))
-                     (make-member-type :members (list opposite))
+                     (make-eql-type opposite)
                      (modified-numeric-type type :low (list opposite) :high nil))))
                 fp-zeroes))
         ;; Easy case
@@ -2901,10 +2932,10 @@ used for a COMPLEX component.~:@>"
         (t (values nil t))))
 
 (!define-type-method (member :simple-intersection2) (type1 type2)
-  (make-member-type :xset (xset-intersection (member-type-xset type1)
-                                             (member-type-xset type2))
-                    :fp-zeroes (intersection (member-type-fp-zeroes type1)
-                                             (member-type-fp-zeroes type2))))
+  (make-member-type (xset-intersection (member-type-xset type1)
+                                       (member-type-xset type2))
+                    (intersection (member-type-fp-zeroes type1)
+                                  (member-type-fp-zeroes type2))))
 
 (!define-type-method (member :complex-intersection2) (type1 type2)
   (block punt
@@ -2922,16 +2953,16 @@ used for a COMPLEX component.~:@>"
        type2)
       (if (and (xset-empty-p xset) (not fp-zeroes))
           *empty-type*
-          (make-member-type :xset xset :fp-zeroes fp-zeroes)))))
+          (make-member-type xset fp-zeroes)))))
 
 ;;; We don't need a :COMPLEX-UNION2, since the only interesting case is
 ;;; a union type, and the member/union interaction is handled by the
 ;;; union type method.
 (!define-type-method (member :simple-union2) (type1 type2)
-  (make-member-type :xset (xset-union (member-type-xset type1)
-                                      (member-type-xset type2))
-                    :fp-zeroes (union (member-type-fp-zeroes type1)
-                                      (member-type-fp-zeroes type2))))
+  (make-member-type (xset-union (member-type-xset type1)
+                                (member-type-xset type2))
+                    (union (member-type-fp-zeroes type1)
+                           (member-type-fp-zeroes type2))))
 
 (!define-type-method (member :simple-=) (type1 type2)
   (let ((xset1 (member-type-xset type1))
@@ -2953,26 +2984,21 @@ used for a COMPLEX component.~:@>"
             (values nil t)))
       (values nil t)))
 
-(!def-type-translator member (&rest members)
+(!def-type-translator member :list (&rest members)
   (if members
       (let (ms numbers char-codes)
         (dolist (m (remove-duplicates members))
           (typecase m
-            (float (if (zerop m)
-                       (push m ms)
-                       (push (ctype-of m) numbers)))
-            (real (push (ctype-of m) numbers))
             (character (push (sb!xc:char-code m) char-codes))
+            (real (if (and (floatp m) (zerop m))
+                      (push m ms)
+                      (push (ctype-of m) numbers)))
             (t (push m ms))))
         (apply #'type-union
-               (if ms
-                   (make-member-type :members ms)
-                   *empty-type*)
-              (if char-codes
-                  (make-character-set-type
-                   :pairs (mapcar (lambda (x) (cons x x))
-                                  (sort char-codes #'<)))
-                  *empty-type*)
+               (member-type-from-list ms)
+               (make-character-set-type
+                :pairs (mapcar (lambda (x) (cons x x))
+                               (sort char-codes #'<)))
                (nreverse numbers)))
       *empty-type*))
 
@@ -3122,9 +3148,10 @@ used for a COMPLEX component.~:@>"
                (setf accumulator
                      (type-intersection accumulator union))))))))
 
-(!def-type-translator and (&whole whole &rest type-specifiers)
+(!def-type-translator and :list ((:context context) &rest type-specifiers)
   (apply #'type-intersection
-         (mapcar #'specifier-type type-specifiers)))
+         (mapcar (lambda (x) (specifier-type-r context x))
+                 type-specifiers)))
 
 ;;;; union types
 
@@ -3294,9 +3321,10 @@ used for a COMPLEX component.~:@>"
                    (type-union accumulator
                                (type-intersection type1 t2))))))))
 
-(!def-type-translator or (&rest type-specifiers)
+(!def-type-translator or :list ((:context context) &rest type-specifiers)
   (let ((type (apply #'type-union
-                     (mapcar #'specifier-type type-specifiers))))
+                     (mapcar (lambda (x) (specifier-type-r context x))
+                             type-specifiers))))
     (if (union-type-p type)
         (sb!kernel::simplify-array-unions type)
         type)))
@@ -3305,9 +3333,10 @@ used for a COMPLEX component.~:@>"
 
 (!define-type-class cons :enumerable nil :might-contain-other-types nil)
 
-(!def-type-translator cons (&optional (car-type-spec '*) (cdr-type-spec '*))
-  (let ((car-type (single-value-specifier-type car-type-spec))
-        (cdr-type (single-value-specifier-type cdr-type-spec)))
+(!def-type-translator cons ((:context context)
+                            &optional (car-type-spec '*) (cdr-type-spec '*))
+  (let ((car-type (single-value-specifier-type-r context car-type-spec))
+        (cdr-type (single-value-specifier-type-r context cdr-type-spec)))
     (make-cons-type car-type cdr-type)))
 
 (!define-type-method (cons :negate) (type)
@@ -3644,7 +3673,7 @@ used for a COMPLEX component.~:@>"
                              (add-to-xset elt xset)))))
                    x-type)
                   (unless (and (xset-empty-p xset) (not fp-zeroes))
-                    (res (make-member-type :xset xset :fp-zeroes fp-zeroes))))
+                    (res (make-member-type xset fp-zeroes))))
                 (dolist (y-type y-types (res x-type))
                   (multiple-value-bind (val win) (csubtypep x-type y-type)
                     (unless win (return-from type-difference nil))
@@ -3663,22 +3692,24 @@ used for a COMPLEX component.~:@>"
                    y-mem)))))
           (apply #'type-union (res))))))
 
-(!def-type-translator array (&optional (element-type '*)
+(!def-type-translator array ((:context context)
+                             &optional (element-type '*)
                                        (dimensions '*))
   (let ((eltype (if (eq element-type '*)
                     *wild-type*
-                    (specifier-type element-type))))
+                    (specifier-type-r context element-type))))
     (make-array-type (canonical-array-dimensions dimensions)
                      :complexp :maybe
                      :element-type eltype
                      :specialized-element-type (%upgraded-array-element-type
                                                 eltype))))
 
-(!def-type-translator simple-array (&optional (element-type '*)
+(!def-type-translator simple-array ((:context context)
+                                    &optional (element-type '*)
                                               (dimensions '*))
   (let ((eltype (if (eq element-type '*)
                     *wild-type*
-                    (specifier-type element-type))))
+                    (specifier-type-r context element-type))))
    (make-array-type (canonical-array-dimensions dimensions)
                     :complexp nil
                     :element-type eltype
@@ -3691,6 +3722,8 @@ used for a COMPLEX component.~:@>"
   (!define-type-class simd-pack :enumerable nil
                       :might-contain-other-types nil)
 
+  ;; Though this involves a recursive call to parser, parsing context need not
+  ;; be passed down, because an unknown-type condition is an immediate failure.
   (!def-type-translator simd-pack (&optional (element-type-spec '*))
      (if (eql element-type-spec '*)
          (%make-simd-pack-type *simd-pack-element-types*)

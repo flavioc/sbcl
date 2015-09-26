@@ -282,7 +282,7 @@
             ;; The place was already taken, and doesn't match our key.
             (return-from try-update-cache-line nil))
           (unless layouts
-            ;; All keys match or succesfully saved, save our value --
+            ;; All keys match or successfully saved, save our value --
             ;; just smash it in. Until the first time it is written
             ;; there is ..EMPTY.. here, which probes look for, so we
             ;; don't get bogus hits. This is necessary because we want
@@ -426,9 +426,7 @@
                 (%fill-cache (copy-cache cache) layouts value t))
                (t
                 (copy-and-expand-cache cache layouts value)))))
-    (if (listp layouts)
-        (%fill-cache cache layouts value nil)
-        (%fill-cache cache (list layouts) value nil))))
+    (%fill-cache cache (ensure-list layouts) value nil)))
 
 ;;; Calls FUNCTION with all layouts and values in cache.
 (defun map-cache (function cache)

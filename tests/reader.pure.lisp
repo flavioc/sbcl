@@ -385,6 +385,12 @@
     (test-reading "#-sbcl(a (b c (d (e) (f) g)) h i j . x . y baz) 5")
     ))
 
+(with-test (:name :sharp-left-paren-empty-list)
+  (assert (read-from-string "#0()")) ; edge case that works
+  (assert (eq (handler-case (read-from-string "#3()")
+                (sb-int:simple-reader-error () :win))
+              :win)))
+
 (with-test (:name :sharp-star-empty-multiple-escapes)
   (assert (eq (handler-case (read-from-string "#*101||1")
                 (sb-int:simple-reader-error () :win))
@@ -407,3 +413,10 @@
                         ;; Signal an error if the symbol is locked.
                         (declare (special sb-int:fast-read-byte))))))))
     (assert-error (funcall fun) program-error)))
+
+(with-test (:name :sharp-plus-requires-subform)
+  (assert-error (read-from-string "(let ((foo 3) #+sbcl) wat)"))
+  (assert-error (read-from-string "(let ((foo 3) #-brand-x) wat)")))
+
+(with-test (:name :impossible-number-error)
+  (princ (nth-value 1 (ignore-errors (READ-FROM-STRING "1/0")))))

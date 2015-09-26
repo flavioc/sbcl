@@ -1468,6 +1468,8 @@
                                     (mask-field (byte 10 0) (cut-test a))))))
              469)))
 
+;; META: there's a test in compiler.pure.lisp that also tests
+;; interaction of PROGV with (debug 3). These tests should be together.
 (with-test (:name :progv-debug-3)
   (unwind-protect
        (sb-ext:restrict-compiler-policy 'debug 3)
@@ -1477,6 +1479,28 @@
                                      (boundp '*v*)))
                      1))
     (sb-ext:restrict-compiler-policy 'debug 0)))
+
+(with-test (:name :restrict-compiler-policy-result)
+  (let ((sb-c::*policy-restrictions* sb-c::*policy-restrictions*))
+    (sb-ext:restrict-compiler-policy 'safety 2)
+    (assertoid:assert-no-signal
+     (compile nil '(lambda () (declare (optimize (safety 0)))))))
+  (let ((sb-c::*policy-restrictions* sb-c::*policy-restrictions*))
+    ;; Passing no arguments returns the current quality/value pairs.
+    (assert (null (sb-ext:restrict-compiler-policy)))
+    (let ((res (sb-ext:restrict-compiler-policy 'safety 2)))
+      ;; returns an alist
+      (assert (equal res '((safety . 2)))))
+    (let ((res (sb-ext:restrict-compiler-policy 'debug 3)))
+      ;; returns an alist, indeterminate order
+      (assert (or (equal res '((safety . 2) (debug . 3)))
+                  (equal res '((debug . 3) (safety . 2))))))
+    ;; remove the SAFETY restriction
+    (let ((res (sb-ext:restrict-compiler-policy 'safety 0)))
+      (assert (equal res '((debug . 3)))))
+    ;; remove the DEBUG restriction
+    (let ((res (sb-ext:restrict-compiler-policy 'debug 0)))
+      (assert (null res)))))
 
 ;;;; tests not in the problem domain, but of the consistency of the
 ;;;; compiler machinery itself
@@ -2425,11 +2449,11 @@
                               (type (integer 0 #.(1- sb-vm:n-word-bits)) n)
                               (optimize speed))
                              (logandc2 x (ash -1 n)))))
-         (trace-output
-          (with-output-to-string (*trace-output*)
-            (eval `(trace ,(intern (format nil "ASH-LEFT-MOD~D" sb-vm::n-word-bits) "SB-VM")))
-            (assert (= 7 (funcall fun 15 3))))))
-    (assert (string= "" trace-output))))
+         (thing-not-to-call
+          (intern (format nil "ASH-LEFT-MOD~D" sb-vm::n-word-bits) "SB-VM")))
+    (assert (not (member (symbol-function thing-not-to-call)
+                         (ctu:find-named-callees fun))))
+    (assert (= 7 (funcall fun 15 3)))))
 
 (test-util:with-test (:name :bug-997528)
   (let ((fun (compile nil '(lambda (x)
@@ -2618,4 +2642,36 @@
     (test-case "foo")
     (test-case '(foo bar))))
 
-;;; success
+(defun catch-compiled-program-error (form &rest values)
+  (multiple-value-bind (function warn fail)
+      (compile nil form)
+    (assert warn)
+    (assert fail)
+    (assert-error (apply function values))))
+
+(with-test (:name :duplicate-&key-no-error)
+  (catch-compiled-program-error
+   '(lambda () (defun duplicate-&key-no-error (&key a a) a))))
+
+(with-test (:name :bad-type-specifiers)
+  (catch-compiled-program-error
+   '(lambda (x) (typep x '(values 10)))
+   1)
+  (catch-compiled-program-error
+   '(lambda () (declare (sb-ext:muffle-conditions 10)))))
+
+(with-test (:name :coverage-and-errors)
+  (ctu:file-compile
+   '((locally (declare (optimize sb-c:store-coverage-data))
+       (1)))))
+
+(symbol-macrolet ((x 30))
+  (macrolet ((foo (y) (+ x y)))
+    (declaim (inline environment-around-inline))
+    (defun environment-around-inline (z)
+      (* z (foo 4)))))
+
+(with-test (:name :environment-around-inline)
+  (defun environment-around-inline.2 (z)
+    (environment-around-inline z))
+  (assert (= (environment-around-inline.2 10) 340)))

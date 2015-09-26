@@ -11,8 +11,6 @@
 
 (in-package "SB!C")
 
-(declaim (special *compiler-error-context*))
-
 ;;;; source-hacking defining forms
 
 ;;; Parse a DEFMACRO-style lambda-list, setting things up so that a
@@ -23,42 +21,39 @@
 ;;; list. START-VAR, NEXT-VAR and RESULT-VAR are bound to the start and
 ;;; result continuations for the resulting IR1. KIND is the function
 ;;; kind to associate with NAME.
+;;; FIXME - Translators which accept implicit PROGNs fail on improper
+;;; input, e.g. (LAMBDA (X) (CATCH X (BAZ) . 3))
+;;; This is because &REST is defined to allow a dotted tail in macros,
+;;; and we have no implementation-specific workaround to disallow it.
 (defmacro def-ir1-translator (name (lambda-list start-var next-var result-var)
                               &body body)
-  (let ((fn-name (symbolicate "IR1-CONVERT-" name)))
-    (with-unique-names (whole-var n-env)
-      (multiple-value-bind (body decls doc)
-          (parse-defmacro lambda-list whole-var body name "special form"
-                          :environment n-env
-                          :error-fun 'compiler-error
-                          :wrap-block nil)
-        (declare (ignorable doc))
-        `(progn
-           (declaim (ftype (function (ctran ctran (or lvar null) t) (values))
-                           ,fn-name))
-           (defun ,fn-name (,start-var ,next-var ,result-var ,whole-var
-                            &aux (,n-env *lexenv*))
-             (declare (ignorable ,start-var ,next-var ,result-var))
-             ,@decls
-             ,body
-             (values))
-           (install-guard-function ',name '(:special ,name) ,(or #!+sb-doc doc))
+  (binding* ((fn-name (symbolicate "IR1-CONVERT-" name))
+             (whole-var (make-symbol "FORM"))
+             ((lambda-expr doc)
+              (make-macro-lambda nil lambda-list body :special-form name
+                                 :doc-string-allowed :external
+                                 :wrap-block nil)))
+    (declare (ignorable doc))
+    `(progn
+      (declaim (ftype (function (ctran ctran (or lvar null) t) (values))
+                      ,fn-name))
+      (defun ,fn-name (,start-var ,next-var ,result-var ,whole-var)
+        (declare (ignorable ,start-var ,next-var ,result-var))
            ;; The guard function is a closure, which can't have its lambda-list
            ;; changed independently of other closures based on the same
            ;; simple-fun. So change it in the ir1-translator since the actual
            ;; lambda-list is not terribly useful.
-           #-sb-xc-host
-           (setf (%fun-lambda-list #',fn-name) ; This is for DESCRIBE et. al.
-                 ',(if (eq (first lambda-list) '&whole)
-                       (cddr lambda-list)
-                       lambda-list))
+        (declare (lambda-list ,lambda-list))
+        (,lambda-expr ,whole-var *lexenv*)
+        (values))
+      (install-guard-function ',name '(:special ,name) ,(or #!+sb-doc doc))
            ;; FIXME: Evidently "there can only be one!" -- we overwrite any
            ;; other :IR1-CONVERT value. This deserves a warning, I think.
-           (setf (info :function :ir1-convert ',name) #',fn-name)
+      (setf (info :function :ir1-convert ',name) #',fn-name)
            ;; FIXME: rename this to SPECIAL-OPERATOR, to update it to
            ;; the 1990s?
-           (setf (info :function :kind ',name) :special-form)
-           ',name)))))
+      (setf (info :function :kind ',name) :special-form)
+      ',name)))
 
 ;;; (This is similar to DEF-IR1-TRANSLATOR, except that we pass if the
 ;;; syntax is invalid.)
@@ -73,27 +68,67 @@
 ;;; Source transforms may only be defined for functions. Source
 ;;; transformation is not attempted if the function is declared
 ;;; NOTINLINE. Source transforms should not examine their arguments.
+;;; A macro lambda list which destructures more than one level would
+;;; be legal but suspicious, as inner list parsing "examines" arguments.
 ;;; If it matters how the function is used, then DEFTRANSFORM should
 ;;; be used to define an IR1 transformation.
 ;;;
 ;;; If the desirability of the transformation depends on the current
 ;;; OPTIMIZE parameters, then the POLICY macro should be used to
 ;;; determine when to pass.
+;;;
+;;; Note that while a compiler-macro must deal with being invoked when its
+;;; whole form matches (FUNCALL <f> ...) so that it must skip over <f> to find
+;;; the arguments, a source-transform need not worry about that situation.
+;;; Any FUNCALL which is eligible for a source-transform calls the expander
+;;; with the form's head replaced by a compiler representation of the function.
+;;; Internalizing the name avoids semantic problems resulting from syntactic
+;;; substitution. One problem would be that a source-transform can exist for
+;;; a function named (SETF X), but ((SETF X) arg ...) would be bad syntax.
+;;; Even if we decided that it is ok within the compiler - just not in code
+;;; given to the compiler - the problem remains that changing (FUNCALL 'F x)
+;;; to (F x) is wrong when F also names a local functionoid.
+;;; Hence, either a #<GLOBAL-VAR> or #<DEFINED-FUN> appears in the form head.
+;;;
 (defmacro define-source-transform (fun-name lambda-list &body body)
-  (with-unique-names (whole-var n-env name)
-    (multiple-value-bind (body decls)
-        (parse-defmacro lambda-list whole-var body "source transform" "form"
-                        :environment n-env
-                        :error-fun `(lambda (&rest stuff)
-                                      (declare (ignore stuff))
-                                      (return-from ,name
-                                        (values nil t)))
-                        :wrap-block nil)
-      `(setf (info :function :source-transform ',fun-name)
-             (lambda (,whole-var &aux (,n-env *lexenv*))
-               ,@decls
-               (block ,name
-                 ,body))))))
+  ;; FIXME: this is redundant with what will become MAKE-MACRO-LAMBDA
+  ;; except that it needs a "silently do nothing" mode, which may or may not
+  ;; be a generally exposed feature.
+  (binding*
+      (((forms decls) (parse-body body))
+       ((llks req opt rest keys aux env whole)
+        (parse-lambda-list
+         lambda-list
+         :accept
+         (logandc2 (logior (lambda-list-keyword-mask '&environment)
+                           (lambda-list-keyword-mask 'destructuring-bind))
+                   ;; Function lambda lists shouldn't take &BODY.
+                   (lambda-list-keyword-mask '&body))
+         :context "a source transform"))
+       ((outer-decl inner-decls) (extract-var-decls decls (append env whole)))
+       ;; With general macros, the user can declare (&WHOLE W &ENVIRONMENT E ..)
+       ;; and then (DECLARE (IGNORE W E)) which is a problem if system code
+       ;; touches user variables. But this is all system code, so it's fine.
+       (lambda-whole (if whole (car whole) (make-symbol "FORM")))
+       (lambda-env (if env (car env) (make-symbol "ENV")))
+       (new-ll (if (or whole env) ; strip them out if present
+                   (make-lambda-list llks whole req opt rest keys aux)
+                   lambda-list)) ; otherwise use the original list
+       (args (make-symbol "ARGS")))
+    `(setf (info :function :source-transform ',fun-name)
+           (named-lambda (:source-transform ,fun-name)
+               (,lambda-whole ,lambda-env &aux (,args (cdr ,lambda-whole)))
+             ,@(if (not env) `((declare (ignore ,lambda-env))))
+             ,@outer-decl ; SPECIALs or something? I hope not.
+             (if ,(emit-ds-lambda-list-match args new-ll)
+                 ;; The body can return 1 or 2 values, but consistently
+                 ;; returning 2 values from the XEP is stylistically
+                 ;; preferable, and produces shorter assembly code too.
+                 (multiple-value-bind (call pass)
+                     (binding* ,(expand-ds-bind new-ll args nil 'truly-the)
+                       ,@inner-decls ,@forms)
+                   (values call pass))
+                 (values nil t))))))
 
 ;;;; boolean attribute utilities
 ;;;;
@@ -259,19 +294,17 @@
 ;;; is a list of all the arguments bound, which the caller should make
 ;;; IGNORABLE if their only purpose is to make the syntax work.
 (defun parse-deftransform (lambda-list node-var error-form)
-  (multiple-value-bind (req opt restp rest keyp keys allowp)
-      (parse-lambda-list lambda-list)
+  (multiple-value-bind (llks req opt rest keys) (parse-lambda-list lambda-list)
     (let* ((tail (make-symbol "ARGS"))
            (dummies (make-gensym-list 2))
            (all-dummies (cons tail dummies))
+           (keyp (ll-kwds-keyp llks))
+           ;; FIXME: the logic for keywordicating a keyword arg specifier
+           ;; is repeated in a as many places as there are calls to
+           ;; parse-lambda-just, and more.
            (keys (mapcar (lambda (spec)
                            (multiple-value-bind (key var)
-                               (if (atom spec)
-                                   (values (keywordicate spec) spec)
-                                   (let ((head (car spec)))
-                                     (if (atom head)
-                                         (values (keywordicate head) head)
-                                         (values (car head) (cadr head)))))
+                               (parse-key-arg-spec spec)
                              (cons var key)))
                          keys))
            final-mandatory-arg)
@@ -294,19 +327,19 @@
           (binds `(,(if (atom arg) arg (car arg)) (pop ,tail))))
         ;; Now if min or max # of args is incorrect,
         ;; or there are unacceptable keywords, bail out
-        (when (or req keyp (not restp))
+        (when (or req keyp (not rest))
           (binds `(,(pop dummies) ; binding is for effect, not value
                    (unless (and ,@(if req `(,final-mandatory-arg))
-                                ,@(if (and (not restp) (not keyp))
+                                ,@(if (and (not rest) (not keyp))
                                       `((endp ,tail)))
                                 ,@(if keyp
-                                      (if allowp
+                                      (if (ll-kwds-allowp llks)
                                           `((check-key-args-constant ,tail))
                                           `((check-transform-keys
                                              ,tail ',(mapcar #'cdr keys))))))
                       ,error-form))))
-        (when restp
-          (binds `(,rest ,tail)))
+        (when rest
+          (binds `(,(car rest) ,tail)))
         ;; Return list of bindings, the list of user-specified symbols,
         ;; and the list of gensyms to be declared ignorable.
         (values (append (binds)
@@ -390,7 +423,7 @@
   (when (and eval-name defun-only)
     (error "can't specify both DEFUN-ONLY and EVAL-NAME"))
   (multiple-value-bind (body decls doc) (parse-body body-decls-doc)
-    (let ((n-node (or node (sb!xc:gensym)))
+    (let ((n-node (or node (make-symbol "NODE")))
           (n-decls (sb!xc:gensym))
           (n-lambda (sb!xc:gensym)))
       (multiple-value-bind (bindings vars)
@@ -401,6 +434,7 @@
                                ,@(when result
                                    `((,result (node-lvar ,n-node)))))
                  (declare (ignorable ,@(mapcar #'car bindings)))
+                 (declare (lambda-list (node)))
                  ,@decls
                  ,@(if policy
                       `((unless (policy ,n-node ,policy)
@@ -423,7 +457,8 @@
                 ,(if eval-name
                      ``(function ,,arg-types ,,result-type)
                      `'(function ,arg-types ,result-type))
-                (lambda ,@stuff)
+                (named-lambda ,(if eval-name "xform" `(deftransform ,name))
+                              ,@stuff)
                 ,doc
                 ,important)))))))
 
@@ -685,13 +720,6 @@
      (%with-ir1-environment-from-node
       ,node
       #'closure-needing-ir1-environment-from-node)))
-(defun %with-ir1-environment-from-node (node fun)
-  (declare (type node node) (type function fun))
-  (let ((*current-component* (node-component node))
-        (*lexenv* (node-lexenv node))
-        (*current-path* (node-source-path node)))
-    (aver-live-component *current-component*)
-    (funcall fun)))
 
 (defmacro with-source-paths (&body forms)
   (with-unique-names (source-paths)
@@ -985,19 +1013,3 @@ specify bindings for printer control variables.")
         (nreverse (mapcar #'car *compiler-print-variable-alist*))
         (nreverse (mapcar #'cdr *compiler-print-variable-alist*))
       ,@forms)))
-
-;;; Like DESTRUCTURING-BIND, but generates a COMPILER-ERROR on failure
-(defmacro compiler-destructuring-bind (lambda-list thing context
-                                       &body body)
-  (let ((whole-name (gensym "WHOLE")))
-    (multiple-value-bind (body local-decls)
-        (parse-defmacro lambda-list whole-name body nil
-                        context
-                        :anonymousp t
-                        :doc-string-allowed nil
-                        :wrap-block nil
-                        :error-fun 'compiler-error)
-      `(let ((,whole-name ,thing))
-         (declare (type list ,whole-name))
-         ,@local-decls
-         ,body))))
